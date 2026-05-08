@@ -12,6 +12,7 @@ eggs/
 env/
 venv/
 .venv/
+.env
 
 # Environment
 .env
