@@ -1,6 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import * as documentService from '../services/documentService';
+import { Document, Page, pdfjs } from 'react-pdf';
+import 'react-pdf/dist/Page/AnnotationLayer.css';
+import 'react-pdf/dist/Page/TextLayer.css';
 import {
   ArrowLeft,
   FileText,
@@ -10,7 +13,22 @@ import {
   AlertCircle,
   Download,
   Eye,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react';
+
+// Configure PDF.js worker — required by react-pdf
+pdfjs.GlobalWorkerOptions.workerSrc = '/pdf.worker.mjs';
+
+// Detect whether the browser has a native PDF viewer (true in Chrome/Firefox/Edge, false in Qt WebEngineView)
+const browserSupportsPDF = navigator.pdfViewerEnabled ?? false;
+
+const pdfOptions = {
+  disableFontFace: true,
+  disableRange: true,
+  disableStream: true,
+  disableAutoFetch: true,
+};
 
 export default function DocumentViewerPage() {
   const { id } = useParams();
@@ -19,6 +37,10 @@ export default function DocumentViewerPage() {
   const [error, setError] = useState(null);
   const [fileUrl, setFileUrl] = useState(null);
   const [showViewer, setShowViewer] = useState(false);
+
+  // React-PDF state (only used when browser doesn't support PDF natively)
+  const [numPages, setNumPages] = useState(null);
+  const [currentPage, setCurrentPage] = useState(1);
 
   useEffect(() => {
     const fetchDoc = async () => {
@@ -47,11 +69,16 @@ export default function DocumentViewerPage() {
     };
     fetchDoc();
 
+    // Cleanup blob URL on unmount
     return () => {
-      // Cleanup blob URL on unmount
       if (fileUrl) URL.revokeObjectURL(fileUrl);
     };
   }, [id]);
+
+  const onDocumentLoadSuccess = useCallback(({ numPages }) => {
+    setNumPages(numPages);
+    setCurrentPage(1);
+  }, []);
 
   if (isLoading) {
     return (
@@ -147,18 +174,79 @@ export default function DocumentViewerPage() {
       {/* Document content area */}
       <div className="flex-1 overflow-y-auto p-6">
         <div className="max-w-4xl mx-auto">
+
           {/* PDF Viewer */}
-          {showViewer && fileUrl && (
-            <div className="mb-6 rounded-lg overflow-hidden border border-cream-200" style={{ height: '70vh' }}>
-              <iframe
-                src={fileUrl}
-                title="Document Viewer"
-                className="w-full h-full"
-                style={{ border: 'none' }}
-              />
-            </div>
+          {showViewer && doc.file_extension === '.pdf' && fileUrl && (
+            browserSupportsPDF ? (
+              /* Browser-native rendering: full-featured plugin (Chrome, Firefox, Edge) */
+              <div
+                className="mb-6 rounded-lg overflow-hidden border border-cream-200"
+                style={{ height: '70vh' }}
+              >
+                <iframe
+                  src={fileUrl}
+                  title="Document Viewer"
+                  className="w-full h-full"
+                  style={{ border: 'none' }}
+                />
+              </div>
+            ) : (
+              /* React-PDF rendering: JS canvas fallback for Qt WebEngineView and unsupported browsers */
+              <div className="mb-6 rounded-lg border border-cream-200 overflow-hidden">
+                {/* Page navigation toolbar */}
+                <div className="flex items-center justify-between bg-white px-4 py-2 border-b border-cream-200">
+                  <button
+                    onClick={() => setCurrentPage((p) => Math.max(p - 1, 1))}
+                    disabled={currentPage <= 1}
+                    className="btn-ghost !p-1.5 disabled:opacity-40"
+                  >
+                    <ChevronLeft size={16} />
+                  </button>
+                  <span className="text-xs text-sand-500">
+                    Page {currentPage} of {numPages ?? '—'}
+                  </span>
+                  <button
+                    onClick={() => setCurrentPage((p) => Math.min(p + 1, numPages ?? p))}
+                    disabled={currentPage >= (numPages ?? 1)}
+                    className="btn-ghost !p-1.5 disabled:opacity-40"
+                  >
+                    <ChevronRight size={16} />
+                  </button>
+                </div>
+
+                {/* PDF canvas */}
+                <div className="overflow-y-auto bg-sand-50 flex justify-center p-4" style={{ maxHeight: '65vh' }}>
+                  <Document
+                    file={fileUrl}
+                    onLoadSuccess={onDocumentLoadSuccess}
+                    options={pdfOptions}
+                    loading={
+                      <div className="flex items-center justify-center py-12">
+                        <Loader2 size={24} className="text-violet-500 animate-spin" />
+                      </div>
+                    }
+                    error={
+                      <div className="flex items-center justify-center py-12 text-sm text-terra-500">
+                        <AlertCircle size={16} className="mr-2" />
+                        Failed to load PDF
+                      </div>
+                    }
+                  >
+                    <Page
+                      // key={currentPage}
+                      pageNumber={currentPage}
+                      width={700}
+                      renderTextLayer={true}
+                      renderAnnotationLayer={true}
+                      renderMode="canvas"
+                    />
+                  </Document>
+                </div>
+              </div>
+            )
           )}
 
+          {/* Loading state while blob URL is being fetched */}
           {showViewer && !fileUrl && doc.file_extension === '.pdf' && (
             <div className="card p-5 mb-6 text-center text-sm text-sand-500">
               <Loader2 size={20} className="animate-spin inline mr-2" />
@@ -166,6 +254,7 @@ export default function DocumentViewerPage() {
             </div>
           )}
 
+          {/* Non-PDF file preview not available */}
           {showViewer && doc.file_extension !== '.pdf' && (
             <div className="card p-5 mb-6 text-center text-sm text-sand-500">
               Preview not available for {doc.file_extension} files. Use the Download button.
@@ -196,19 +285,7 @@ export default function DocumentViewerPage() {
 
           {/* Entities */}
           {doc.entities && doc.entities.length > 0 && (
-            <div className="mb-6">
-              <h3 className="text-sm font-semibold text-ink-900 mb-2">Entities</h3>
-              <div className="flex flex-wrap gap-2">
-                {doc.entities.map((entity, idx) => (
-                  <span
-                    key={idx}
-                    className="badge bg-forest-500/10 text-forest-500"
-                  >
-                    {entity.name || entity}
-                  </span>
-                ))}
-              </div>
-            </div>
+            <EntitiesSection entities={doc.entities} />
           )}
 
           {/* Document details card */}
@@ -235,6 +312,41 @@ export default function DocumentViewerPage() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+function EntitiesSection({ entities }) {
+  const [showAll, setShowAll] = useState(false);
+  const visible = showAll ? entities : entities.slice(0, 10);
+
+  return (
+    <div className="mb-6">
+      <h3 className="text-sm font-semibold text-ink-900 mb-2">
+        Entities
+        <span className="ml-2 text-xs font-normal text-sand-500">
+          ({entities.length} found)
+        </span>
+      </h3>
+      <div className="flex flex-wrap gap-2">
+        {visible.map((entity, idx) => (
+          <span
+            key={idx}
+            className="badge bg-forest-500/10 text-forest-500"
+          >
+            {entity.name || entity}
+          </span>
+        ))}
+      </div>
+      {entities.length > 10 && (
+        <button
+          onClick={() => setShowAll((v) => !v)}
+          className="mt-2 text-xs text-violet-500 hover:underline"
+        >
+          {showAll
+            ? 'Show less'
+            : `Show ${entities.length - 10} more entities`}
+        </button>
+      )}
     </div>
   );
 }

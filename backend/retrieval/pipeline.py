@@ -1,25 +1,26 @@
 """
 Deep Query — Retrieval Pipeline
 
-Orchestrates the full query → answer flow:
-1. Embed query (Gemini Embedding 2)
-2. Dense retrieval (ChromaDB) + Sparse retrieval (BM25)
-3. Reciprocal Rank Fusion
-4. Cross-encoder reranking
-5. Knowledge graph augmentation (Neo4j)
-6. RAG generation (Llama 3 via Groq)
-7. Self-correction verification
+Orchestrates the full query → answer flow with parallel execution:
+1. Group A (parallel): Embed query, BM25 search, Entity extraction
+2. Group B (parallel): Dense retrieval, Graph traversal
+3. Group C (sequential): RRF fusion, Cross-encoder reranking
+4. Group D (sequential): RAG generation, Self-correction
 """
 
+import asyncio
 import json
 import logging
+import math
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from core.constants import (
+    COSINE_SIMILARITY_THRESHOLD,
     DENSE_TOP_K,
     FINAL_CONTEXT_CHUNKS,
+    MIN_RERANK_CANDIDATES,
     RERANK_TOP_N,
     SPARSE_TOP_K,
 )
@@ -27,17 +28,64 @@ from core.constants import (
 logger = logging.getLogger(__name__)
 
 
+def apply_cosine_similarity_filter(
+    candidates: List[Dict],
+    threshold: float,
+    min_candidates: int,
+) -> List[Dict]:
+    """Filter candidates by cosine similarity threshold before reranking.
+
+    ChromaDB returns cosine distance (0 = identical, 2 = opposite).
+    We convert to similarity: similarity = 1 - (distance / 2)
+
+    Args:
+        candidates: List of retrieval candidates from RRF fusion.
+        threshold: Minimum cosine similarity to keep (e.g., 0.45).
+        min_candidates: Minimum number of candidates to return even if below threshold.
+
+    Returns:
+        Filtered list of candidates.
+    """
+    # Attach cosine similarity scores to each candidate
+    for candidate in candidates:
+        distance = candidate.get("distance", 1.0)
+        # Convert cosine distance to similarity (normalize to 0-1 range)
+        # ChromaDB cosine distance is in [0, 2], where 0 = identical
+        candidate["cosine_similarity"] = 1.0 - (distance / 2.0)
+
+    # Filter by threshold
+    above_threshold = [
+        c for c in candidates if c.get("cosine_similarity", 0.0) >= threshold
+    ]
+
+    # If we have enough candidates above threshold, return them
+    if len(above_threshold) >= min_candidates:
+        return above_threshold
+
+    # Otherwise, return top N by cosine similarity regardless of threshold
+    logger.warning(
+        f"Only {len(above_threshold)} candidates above threshold {threshold}. "
+        f"Relaxing to top {min_candidates * 2} by similarity."
+    )
+    sorted_by_similarity = sorted(
+        candidates, key=lambda x: x.get("cosine_similarity", 0.0), reverse=True
+    )
+    return sorted_by_similarity[: min_candidates * 2]
+
+
 async def retrieval_pipeline(
     query: str,
     allowed_collections: List[str],
     image_base64: Optional[str] = None,
+    chat_history: Optional[list] = None,
 ) -> Dict[str, Any]:
-    """Execute the full retrieval + generation pipeline.
+    """Execute the full retrieval + generation pipeline with parallel execution.
 
     Args:
         query: User's natural-language question.
         allowed_collections: ChromaDB collections the user can access.
         image_base64: Optional base64 image for multimodal query.
+        chat_history: Previous conversation turns for context.
 
     Returns:
         dict with 'answer', 'citations', 'self_correction_status',
@@ -52,14 +100,47 @@ async def retrieval_pipeline(
 
     start = time.time()
 
-    # ── Step 1: Embed the query ──────────────────────────────
-    logger.info("Step 1: Embedding query")
-    if image_base64:
-        import base64
-        image_bytes = base64.b64decode(image_base64)
-        query_embedding = gemini_embedder.embed_multimodal(query, image_bytes)
-    else:
-        query_embedding = gemini_embedder.embed_text(query, task_type="RETRIEVAL_QUERY")
+    # ── GROUP A: Parallel execution (embedding, BM25, entity extraction) ──
+    logger.info("Group A: Embedding, BM25 search, entity extraction (parallel)")
+
+    async def embed_query_task():
+        """Task: Embed the query using Gemini."""
+        loop = asyncio.get_event_loop()
+        if image_base64:
+            import base64
+            image_bytes = base64.b64decode(image_base64)
+            return await loop.run_in_executor(
+                None, gemini_embedder.embed_multimodal, query, image_bytes
+            )
+        else:
+            return await loop.run_in_executor(
+                None, gemini_embedder.embed_text, query, "RETRIEVAL_QUERY"
+            )
+
+    async def bm25_search_task():
+        """Task: BM25 sparse retrieval."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, bm25_retriever.search, query, allowed_collections, SPARSE_TOP_K
+        )
+
+    async def entity_extraction_task():
+        """Task: Extract entities from query for graph traversal."""
+        loop = asyncio.get_event_loop()
+        try:
+            return await loop.run_in_executor(
+                None, groq_client.extract_query_entities, query
+            )
+        except Exception as e:
+            logger.warning(f"Entity extraction failed: {e}")
+            return []
+
+    # Run Group A in parallel
+    query_embedding, sparse_results, entity_names = await asyncio.gather(
+        embed_query_task(),
+        bm25_search_task(),
+        entity_extraction_task(),
+    )
 
     if query_embedding is None:
         return {
@@ -70,82 +151,97 @@ async def retrieval_pipeline(
             "chunks_retrieved": 0,
         }
 
-    # ── Step 2a: Dense retrieval (ChromaDB) ──────────────────
-    logger.info("Step 2a: Dense retrieval")
-    dense_results = chroma_store.query_multiple_collections(
-        collection_names=allowed_collections,
-        query_embedding=query_embedding,
-        n_results=DENSE_TOP_K,
+    # ── GROUP B: Parallel execution (dense search, graph traversal) ──
+    logger.info("Group B: Dense retrieval, graph traversal (parallel)")
+
+    async def dense_search_task():
+        """Task: ChromaDB dense vector search."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            chroma_store.query_multiple_collections,
+            allowed_collections,
+            query_embedding,
+            DENSE_TOP_K,
+        )
+
+    async def graph_traversal_task():
+        """Task: Neo4j graph context retrieval."""
+        loop = asyncio.get_event_loop()
+        try:
+            if entity_names:
+                return await loop.run_in_executor(
+                    None, neo4j_client.get_entity_context, entity_names
+                )
+            return ""
+        except Exception as e:
+            logger.warning(f"Graph traversal failed: {e}")
+            return ""
+
+    # Run Group B in parallel
+    dense_results, graph_context = await asyncio.gather(
+        dense_search_task(),
+        graph_traversal_task(),
     )
 
-    # ── Step 2b: Sparse retrieval (BM25) ─────────────────────
-    logger.info("Step 2b: Sparse retrieval")
-    sparse_results = bm25_retriever.search(
-        query=query,
-        allowed_collections=allowed_collections,
-        top_k=SPARSE_TOP_K,
-    )
+    # ── GROUP C: Sequential execution (RRF, reranking, context assembly) ──
+    logger.info("Group C: RRF fusion, pre-filter, reranking (sequential)")
 
-    # ── Step 3: Reciprocal Rank Fusion ───────────────────────
-    logger.info("Step 3: RRF fusion")
+    # RRF fusion
     fused_results = reciprocal_rank_fusion(dense_results, sparse_results)
 
-    # ── Step 4: Reranking ────────────────────────────────────
-    logger.info("Step 4: Cross-encoder reranking")
-    reranked = reranker.rerank(query, fused_results, top_n=RERANK_TOP_N)
+    # Pre-filter: Remove candidates with low cosine similarity
+    filtered_results = apply_cosine_similarity_filter(
+        fused_results, COSINE_SIMILARITY_THRESHOLD, MIN_RERANK_CANDIDATES
+    )
+    logger.info(
+        f"Pre-filter: {len(fused_results)} → {len(filtered_results)} candidates "
+        f"(threshold={COSINE_SIMILARITY_THRESHOLD})"
+    )
 
-    # ── Step 5: Knowledge graph augmentation ─────────────────
-    logger.info("Step 5: Knowledge graph augmentation")
-    graph_context = ""
-    try:
-        entity_names = groq_client.extract_query_entities(query)
-        if entity_names:
-            graph_context = neo4j_client.get_entity_context(entity_names)
-    except Exception as e:
-        logger.warning(f"Graph augmentation failed: {e}")
+    # Cross-encoder reranking
+    loop = asyncio.get_event_loop()
+    reranked = await loop.run_in_executor(
+        None, reranker.rerank, query, filtered_results, RERANK_TOP_N
+    )
 
-    # ── Step 6: RAG generation ───────────────────────────────
-    logger.info("Step 6: RAG generation")
+    # Select top chunks for context
     context_chunks = reranked[:FINAL_CONTEXT_CHUNKS]
 
     # Format chunks for the LLM
     formatted_chunks = []
     for chunk in context_chunks:
         meta = chunk.get("metadata", {})
+        # Normalise rerank_score to 0-1 via sigmoid; fall back to cosine_similarity
+        raw_rerank = chunk.get("rerank_score")
+        if raw_rerank is not None:
+            relevance = round(1.0 / (1.0 + math.exp(-float(raw_rerank))), 3)
+        else:
+            relevance = round(float(chunk.get("cosine_similarity", 0.5)), 3)
         formatted_chunks.append({
             "text": chunk.get("document", chunk.get("text", "")),
             "source": meta.get("original_filename", "Unknown"),
             "page": meta.get("page_number", "N/A"),
             "summary": meta.get("summary", ""),
             "document_id": meta.get("source_document_id", ""),
+            "relevance_score": relevance,
         })
 
-    answer = groq_client.generate_answer(
-        query=query,
-        context_chunks=formatted_chunks,
-        graph_context=graph_context,
+    # ── GROUP D: RAG generation (self-correction will be non-blocking) ──
+    logger.info("Group D: RAG generation")
+
+    # RAG generation
+    answer = await loop.run_in_executor(
+        None,
+        groq_client.generate_answer,
+        query,
+        formatted_chunks,
+        graph_context,
+        chat_history,
     )
 
     if answer is None:
         answer = "I'm sorry, I was unable to generate an answer. Please try again."
-
-    # ── Step 7: Self-correction ──────────────────────────────
-    logger.info("Step 7: Self-correction")
-    correction_result = groq_client.verify_answer(
-        query=query,
-        answer=answer,
-        context_chunks=formatted_chunks,
-    )
-
-    outcome = correction_result.get("outcome", "VERIFIED")
-    if outcome == "CORRECTED":
-        answer = correction_result.get("corrected_answer", answer)
-    elif outcome == "INSUFFICIENT_CONTEXT":
-        answer = (
-            "Based on the available documents, I could not find sufficient "
-            "information to fully answer this question.\n\n"
-            + correction_result.get("explanation", "")
-        )
 
     # ── Build citations ──────────────────────────────────────
     citations = []
@@ -156,15 +252,19 @@ async def retrieval_pipeline(
             "page_number": chunk["page"],
             "chunk_summary": chunk["summary"],
             "document_id": chunk["document_id"],
+            "relevance_score": chunk.get("relevance_score", 0.5),
         })
 
     elapsed = time.time() - start
     logger.info(f"Retrieval pipeline completed in {elapsed:.2f}s")
 
+    # Return answer and data for self-correction (to be done by endpoint)
     return {
         "answer": answer,
         "citations": citations,
-        "self_correction_status": outcome,
+        "formatted_chunks": formatted_chunks,  # For self-correction
+        "query": query,  # For self-correction
+        "self_correction_status": "PENDING",  # Will be verified in background
         "related_documents": [],
         "chunks_retrieved": len(context_chunks),
         "retrieval_time_ms": int(elapsed * 1000),
@@ -181,7 +281,7 @@ async def search_pipeline(
     page: int = 1,
     per_page: int = 10,
 ) -> Dict:
-    """Search pipeline for the dashboard (no LLM generation).
+    """Search pipeline for the dashboard (no LLM generation) with parallel execution.
 
     Returns structured results with relevance scores.
     """
@@ -190,26 +290,38 @@ async def search_pipeline(
     from retrieval.reranker import reranker
     from vectorstore.chroma_store import chroma_store
 
-    # Embed query
-    query_embedding = gemini_embedder.embed_text(query, task_type="RETRIEVAL_QUERY")
-    if query_embedding is None:
-        return {"results": [], "total": 0, "query": query}
+    loop = asyncio.get_event_loop()
 
     # Build metadata filter
     where_filter = {}
     if document_type:
         where_filter["document_type"] = document_type
 
-    # Dense retrieval with filters
-    dense_results = chroma_store.query_multiple_collections(
-        collection_names=allowed_collections,
-        query_embedding=query_embedding,
-        n_results=DENSE_TOP_K * 2,
-        where_filter=where_filter if where_filter else None,
-    )
+    # Parallel execution: Embed query and BM25 search
+    async def embed_task():
+        return await loop.run_in_executor(
+            None, gemini_embedder.embed_text, query, "RETRIEVAL_QUERY"
+        )
 
-    # Sparse retrieval
-    sparse_results = bm25_retriever.search(query, allowed_collections, SPARSE_TOP_K)
+    async def bm25_task():
+        return await loop.run_in_executor(
+            None, bm25_retriever.search, query, allowed_collections, SPARSE_TOP_K
+        )
+
+    query_embedding, sparse_results = await asyncio.gather(embed_task(), bm25_task())
+
+    if query_embedding is None:
+        return {"results": [], "total": 0, "query": query}
+
+    # Dense retrieval with filters
+    dense_results = await loop.run_in_executor(
+        None,
+        chroma_store.query_multiple_collections,
+        allowed_collections,
+        query_embedding,
+        DENSE_TOP_K * 2,
+        where_filter if where_filter else None,
+    )
 
     # RRF + Rerank
     fused = reciprocal_rank_fusion(dense_results, sparse_results)

@@ -155,6 +155,7 @@ function UserFormModal({ user, onSave, onClose }) {
     username: user?.username || '',
     email: user?.email || '',
     password: '',
+    full_name: user?.full_name || '',
     role: user?.role || 'student',
     department: user?.department || '',
     is_active: user?.is_active !== false,
@@ -171,9 +172,14 @@ function UserFormModal({ user, onSave, onClose }) {
       if (user && !payload.password) {
         delete payload.password;
       }
+      // Remove department before sending to backend if not needed
+      delete payload.department;
       await onSave(payload);
     } catch (err) {
-      setError(err.response?.data?.detail || 'Failed to save user');
+      // Defensive: handle both axios and fetch errors
+      let detail = err?.response?.data?.detail || err?.message || 'Failed to save user';
+      setError(detail);
+    } finally {
       setSaving(false);
     }
   };
@@ -203,6 +209,17 @@ function UserFormModal({ user, onSave, onClose }) {
               type="text"
               value={form.username}
               onChange={(e) => setForm({ ...form, username: e.target.value })}
+              className="input"
+              required
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-ink-700 mb-1">Full Name</label>
+            <input
+              type="text"
+              value={form.full_name}
+              onChange={(e) => setForm({ ...form, full_name: e.target.value })}
               className="input"
               required
             />

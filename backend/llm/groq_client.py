@@ -72,6 +72,7 @@ class GroqClient:
         query: str,
         context_chunks: List[Dict[str, Any]],
         graph_context: str = "",
+        chat_history: Optional[list] = None,
     ) -> Optional[str]:
         """Generate a RAG answer with citations.
 
@@ -96,10 +97,21 @@ class GroqClient:
         if graph_context:
             context += f"\n\n[Knowledge Graph Context]\n{graph_context}"
 
-        messages = [
-            SystemMessage(content=RAG_GENERATION_PROMPT),
-            HumanMessage(content=f"Context:\n{context}\n\nQuestion: {query}"),
-        ]
+
+        # Build chat history for LLM prompt
+        messages = [SystemMessage(content=RAG_GENERATION_PROMPT)]
+        if chat_history:
+            for turn in chat_history:
+                if turn["role"] == "user":
+                    messages.append(HumanMessage(content=turn["content"]))
+                elif turn["role"] == "assistant":
+                    messages.append(SystemMessage(content=turn["content"]))
+        else:
+            messages.append(HumanMessage(content=f"Context:\n{context}\n\nQuestion: {query}"))
+
+        # Always append the context and current question as the last user message
+        if chat_history:
+            messages.append(HumanMessage(content=f"Context:\n{context}\n\nQuestion: {query}"))
 
         return self._call_with_retry(
             messages, LLM_TEMPERATURES["rag_generation"]

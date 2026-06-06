@@ -9,6 +9,7 @@ GET    /api/documents/status/{job_id}
 """
 
 import json
+import logging
 import uuid
 from pathlib import Path
 
@@ -39,6 +40,15 @@ def _doc_to_response(doc: Document) -> DocumentResponse:
             tags = json.loads(doc.topic_tags)
         except (json.JSONDecodeError, TypeError):
             tags = []
+    
+    # Fetch entities from Neo4j
+    entities = []
+    try:
+        from knowledge_graph.neo4j_client import neo4j_client
+        entities = neo4j_client.get_entities_by_document(doc.id)
+    except Exception as e:
+        logger.warning(f"Failed to fetch entities for document {doc.id}: {e}")
+    
     return DocumentResponse(
         id=doc.id,
         original_filename=doc.original_filename,
@@ -48,6 +58,8 @@ def _doc_to_response(doc: Document) -> DocumentResponse:
         collection=doc.collection,
         summary=doc.summary,
         topic_tags=tags,
+        keywords=tags,  # Populate keywords from topic_tags for frontend
+        entities=entities,  # Populated from Neo4j
         category=doc.category,
         page_count=doc.page_count,
         chunk_count=doc.chunk_count,
@@ -173,6 +185,74 @@ def get_job_status(
         started_at=job.started_at,
         completed_at=job.completed_at,
     )
+
+
+# NOTE: literal paths must be declared before the dynamic "/{document_id}"
+# route, otherwise FastAPI matches them as a document_id (e.g. "similarity-map").
+@router.get("/similarity-map")
+def get_similarity_map(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return pre-computed UMAP 2-D coordinates for all documents accessible to the user.
+
+    Returns 404 if coordinates have not been computed yet.
+    Filters documents to the user's allowed collections (RBAC).
+    """
+    from core.constants import ROLE_COLLECTIONS, UserRole as URole
+
+    allowed_collections = [
+        c.value for c in ROLE_COLLECTIONS.get(URole(user.role), [])
+    ]
+
+    docs = (
+        db.query(Document)
+        .filter(
+            Document.is_deleted == False,
+            Document.umap_x != None,
+            Document.collection.in_(allowed_collections),
+        )
+        .all()
+    )
+
+    if not docs:
+        raise HTTPException(
+            status_code=404,
+            detail="UMAP coordinates have not been computed yet. "
+                   "An admin can trigger computation via POST /api/admin/recompute-similarity-map.",
+        )
+
+    points = []
+    last_computed = None
+    for doc in docs:
+        tags = []
+        if doc.topic_tags:
+            try:
+                tags = json.loads(doc.topic_tags)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        points.append({
+            "id": doc.id,
+            "x": doc.umap_x,
+            "y": doc.umap_y,
+            "document_name": doc.original_filename,
+            "document_type": doc.document_type.value if doc.document_type else "other",
+            "collection": doc.collection,
+            "topic_tags": tags,
+            "upload_date": doc.upload_timestamp.isoformat() if doc.upload_timestamp else None,
+            "page_count": doc.page_count,
+        })
+        if doc.umap_computed_at and (
+            last_computed is None or doc.umap_computed_at > last_computed
+        ):
+            last_computed = doc.umap_computed_at
+
+    return {
+        "points": points,
+        "total": len(points),
+        "last_computed_at": last_computed.isoformat() if last_computed else None,
+    }
 
 
 @router.get("/{document_id}", response_model=DocumentResponse)

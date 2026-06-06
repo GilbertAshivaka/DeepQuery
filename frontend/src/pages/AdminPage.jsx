@@ -4,19 +4,22 @@ import UploadTab from '../components/admin/UploadTab';
 import DocumentsTab from '../components/admin/DocumentsTab';
 import UsersTab from '../components/admin/UsersTab';
 import StatsTab from '../components/admin/StatsTab';
+import KnowledgeGapsTab from '../components/admin/KnowledgeGapsTab';
 import {
   Upload,
   FileText,
   Users,
   BarChart3,
   Shield,
+  AlertTriangle,
 } from 'lucide-react';
 
 const tabs = [
-  { id: 'upload', label: 'Upload', icon: Upload },
-  { id: 'documents', label: 'Documents', icon: FileText },
-  { id: 'users', label: 'Users', icon: Users },
-  { id: 'stats', label: 'Analytics', icon: BarChart3 },
+  { id: 'upload',    label: 'Upload',          icon: Upload },
+  { id: 'documents', label: 'Documents',        icon: FileText },
+  { id: 'users',     label: 'Users',            icon: Users },
+  { id: 'stats',     label: 'Analytics',        icon: BarChart3 },
+  { id: 'gaps',      label: 'Knowledge Gaps',   icon: AlertTriangle },
 ];
 
 export default function AdminPage() {
@@ -59,10 +62,11 @@ export default function AdminPage() {
 
       {/* Tab content */}
       <div className="flex-1 overflow-y-auto">
-        {activeTab === 'upload' && <UploadTab />}
+        {activeTab === 'upload'    && <UploadTab />}
         {activeTab === 'documents' && <DocumentsTab />}
-        {activeTab === 'users' && <UsersTab />}
-        {activeTab === 'stats' && <StatsTab />}
+        {activeTab === 'users'     && <UsersTab />}
+        {activeTab === 'stats'     && <StatsTab />}
+        {activeTab === 'gaps'      && <KnowledgeGapsTab />}
       </div>
     </div>
   );

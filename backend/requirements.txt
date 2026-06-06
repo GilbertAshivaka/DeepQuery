@@ -71,3 +71,6 @@ pytest-cov==6.0.0
 # ── Image Processing ──
 opencv-python-headless==4.10.0.84
 numpy>=1.26.0
+
+# ── Dimensionality Reduction (Document Similarity Map) ──
+umap-learn>=0.5.6

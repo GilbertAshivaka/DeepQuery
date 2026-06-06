@@ -37,5 +37,17 @@ celery_app.conf.update(
 # Auto-discover tasks from the tasks package
 celery_app.autodiscover_tasks(["tasks"])
 
-# Explicit import to ensure task registration
+# Explicit imports to ensure task registration
 import tasks.ingestion_task  # noqa: F401, E402
+import tasks.umap_task       # noqa: F401, E402
+
+# ── Beat schedule (periodic tasks) ──────────────────────────
+from celery.schedules import crontab
+
+celery_app.conf.beat_schedule = {
+    # Recompute UMAP coordinates nightly at 02:00 UTC
+    "umap-nightly": {
+        "task": "tasks.compute_umap_coordinates",
+        "schedule": crontab(hour=2, minute=0),
+    },
+}

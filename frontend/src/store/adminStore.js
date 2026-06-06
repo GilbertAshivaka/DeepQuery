@@ -156,7 +156,13 @@ export const useAdminStore = create((set, get) => ({
   loadKnowledgeGaps: async (days = 30) => {
     try {
       const data = await adminService.getKnowledgeGaps(days);
-      set({ knowledgeGaps: data });
+      // The endpoint returns a matrix object { recent_gaps, top_gaps, ... }.
+      // StatsTab shows the raw unanswered queries (recent_gaps); fall back to
+      // the aggregated top_gaps, then to an array, for resilience.
+      const gaps = Array.isArray(data)
+        ? data
+        : (data?.recent_gaps ?? data?.top_gaps ?? []);
+      set({ knowledgeGaps: gaps });
     } catch {
       // Silently fail
     }

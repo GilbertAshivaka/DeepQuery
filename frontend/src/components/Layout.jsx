@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
-import { Outlet, NavLink, useNavigate } from 'react-router-dom';
+import { Outlet, NavLink, useNavigate, useLocation } from 'react-router-dom';
+import ErrorBoundary from './ErrorBoundary';
 import { useAuthStore } from '../store/authStore';
 import { useChatStore } from '../store/chatStore';
 import {
@@ -14,11 +15,18 @@ import {
   MoreHorizontal,
   Pin,
   Trash2,
+  Network,
+  ScatterChart,
 } from 'lucide-react';
 
 const navItems = [
   { to: '/chat', icon: MessageSquare, label: 'Chat' },
   { to: '/search', icon: Search, label: 'Search' },
+];
+
+const graphNavItems = [
+  { to: '/graph',  icon: Network,      label: 'Knowledge Graph' },
+  { to: '/corpus', icon: ScatterChart, label: 'Corpus Explorer' },
 ];
 
 const adminNavItems = [
@@ -36,6 +44,7 @@ export default function Layout() {
     togglePinConversation,
   } = useChatStore();
   const navigate = useNavigate();
+  const location = useLocation();
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showHistory, setShowHistory] = useState(false);
   const [menuOpenId, setMenuOpenId] = useState(null);
@@ -53,6 +62,7 @@ export default function Layout() {
   }, []);
 
   const isAdmin = user?.role === 'admin';
+  const canViewGraph = user?.role === 'admin' || user?.role === 'researcher';
 
   const handleNewChat = () => {
     startNewConversation();
@@ -101,16 +111,19 @@ export default function Layout() {
               </h1>
             </div>
           )}
-          <button
-            onClick={() => setSidebarOpen(!sidebarOpen)}
-            className="ml-auto p-1.5 rounded-lg text-ink-700 hover:text-ink-900 hover:bg-black/5 transition-all"
-          >
-            {sidebarOpen ? <X size={16} /> : <Menu size={16} />}
-          </button>
         </div>
 
-        {/* New Chat Button */}
-        <div className="relative px-3 pt-4 pb-2">
+        {/* Sidebar toggle + New Chat */}
+        <div className="relative px-3 pt-4 pb-2 space-y-2">
+          <div className={`flex ${sidebarOpen ? 'justify-end' : 'justify-center'}`}>
+            <button
+              onClick={() => setSidebarOpen(!sidebarOpen)}
+              className="p-2.5 rounded-xl text-ink-700 hover:text-ink-900 hover:bg-white/40 transition-all"
+              title={sidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+            >
+              {sidebarOpen ? <X size={16} /> : <Menu size={16} />}
+            </button>
+          </div>
           <button
             onClick={handleNewChat}
             className={`w-full inline-flex items-center justify-center gap-2 px-4 py-2.5
@@ -145,6 +158,27 @@ export default function Layout() {
               {sidebarOpen && <span>{label}</span>}
             </NavLink>
           ))}
+
+          {canViewGraph &&
+            graphNavItems.map(({ to, icon: Icon, label }) => (
+              <NavLink
+                key={to}
+                to={to}
+                className={({ isActive }) =>
+                  `flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium
+                  transition-all duration-200
+                  ${
+                    isActive
+                      ? 'bg-white/50 text-ink-900 shadow-warm-sm'
+                      : 'text-ink-700 hover:text-ink-900 hover:bg-white/40'
+                  }
+                  ${!sidebarOpen ? 'justify-center !px-0' : ''}`
+                }
+              >
+                <Icon size={18} />
+                {sidebarOpen && <span>{label}</span>}
+              </NavLink>
+            ))}
 
           {isAdmin &&
             adminNavItems.map(({ to, icon: Icon, label }) => (
@@ -294,7 +328,9 @@ export default function Layout() {
 
       {/* Main content */}
       <main className="flex-1 overflow-hidden">
-        <Outlet />
+        <ErrorBoundary key={location.pathname}>
+          <Outlet />
+        </ErrorBoundary>
       </main>
     </div>
   );

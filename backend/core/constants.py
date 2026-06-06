@@ -11,6 +11,8 @@ from enum import Enum
 class UserRole(str, Enum):
     STUDENT = "student"
     RESEARCHER = "researcher"
+    LECTURER = "lecturer"
+    HOD = "hod"
     STAFF = "staff"
     ADMIN = "admin"
 
@@ -80,6 +82,10 @@ DENSE_TOP_K = 20
 SPARSE_TOP_K = 20
 RERANK_TOP_N = 8
 FINAL_CONTEXT_CHUNKS = 5
+
+# ── Cross-Encoder Pre-Filter ─────────────────────────────────
+COSINE_SIMILARITY_THRESHOLD = 0.45  # Filter candidates below this before reranking
+MIN_RERANK_CANDIDATES = 3  # Minimum candidates to send to reranker
 
 # ── Max token budget for RAG prompt ──────────────────────────
 RAG_PROMPT_TOKEN_BUDGET = 8000

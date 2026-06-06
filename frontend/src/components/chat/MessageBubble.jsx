@@ -2,6 +2,7 @@ import { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { motion } from 'framer-motion';
 import { User, Bot, AlertCircle, Copy, Check } from 'lucide-react';
+import SelfCorrectionBadge from './SelfCorrectionBadge';
 
 export default function MessageBubble({ message, isStreaming, onSourceClick }) {
   const isUser = message.role === 'user';
@@ -32,6 +33,9 @@ export default function MessageBubble({ message, isStreaming, onSourceClick }) {
 
   // Support both 'sources' (from streaming) and 'citations' (from DB reload)
   const sources = message.sources || message.citations || [];
+  // Status lives in metadata when streamed, top-level when reloaded from DB.
+  const selfCorrectionStatus =
+    message.metadata?.self_correction_status ?? message.self_correction_status;
 
   return (
     <motion.div
@@ -70,14 +74,14 @@ export default function MessageBubble({ message, isStreaming, onSourceClick }) {
             </div>
           )}
 
-          {/* Sources (citations) */}
+          {/* Source citation pills */}
           {sources.length > 0 && (
             <div className="flex flex-wrap gap-1.5 mt-3">
               {sources.map((source, idx) => (
                 <button
                   key={idx}
                   onClick={() => onSourceClick?.(source)}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium 
+                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium
                              bg-cream-100 text-amber-900 rounded-lg border border-cream-200
                              hover:bg-amber-900/10 hover:border-amber-900/20 transition-all"
                 >
@@ -92,12 +96,17 @@ export default function MessageBubble({ message, isStreaming, onSourceClick }) {
             </div>
           )}
 
-          {/* Copy button */}
+          {/* Cache indicator and Copy button */}
           {!isStreaming && message.content && (
-            <div className="mt-1.5">
+            <div className="mt-1.5 flex items-center gap-2">
+              {/* Self-correction trust badge — icon only, left of Copy */}
+              {selfCorrectionStatus && (
+                <SelfCorrectionBadge status={selfCorrectionStatus} />
+              )}
+
               <button
                 onClick={handleCopy}
-                className="inline-flex items-center gap-1 px-2 py-1 text-[11px] text-ink-600 
+                className="inline-flex items-center gap-1 px-2 py-1 text-[11px] text-ink-600
                            hover:text-ink-900 hover:bg-cream-100 rounded-md transition-all"
                 title="Copy response"
               >
@@ -107,15 +116,18 @@ export default function MessageBubble({ message, isStreaming, onSourceClick }) {
                   <><Copy size={12} /> Copy</>
                 )}
               </button>
+
+              {/* Cache hit indicator */}
+              {message.metadata?.cache_hit && (
+                <span className="inline-flex items-center gap-1 px-2 py-1 text-[10px] text-violet-600
+                                 bg-violet-50 rounded-md border border-violet-200"
+                      title="Retrieved from cache (sub-100ms response)">
+                  ⚡ Cached
+                </span>
+              )}
             </div>
           )}
 
-          {/* Metadata */}
-          {message.metadata?.correction_applied && (
-            <p className="text-[10px] text-forest-500 mt-1">
-              ✓ Self-corrected for accuracy
-            </p>
-          )}
         </div>
       )}
     </motion.div>

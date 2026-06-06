@@ -65,6 +65,24 @@ async def chat_query(
         db.commit()
         db.refresh(conversation)
 
+
+    # Fetch last 10 messages for chat history (excluding current message)
+    history_messages = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation.id)
+        .order_by(Message.created_at.desc())
+        .limit(10)
+        .all()
+    )
+    # Reverse to chronological order
+    history_messages = list(reversed(history_messages))
+
+    # Add the current user message to the history (not yet in DB)
+    chat_history = [
+        {"role": m.role, "content": m.content} for m in history_messages
+    ]
+    chat_history.append({"role": "user", "content": body.query})
+
     # Save user message
     user_msg = Message(
         conversation_id=conversation.id,
@@ -85,30 +103,93 @@ async def chat_query(
         """Generate SSE events for the chat response."""
         try:
             from retrieval.pipeline import retrieval_pipeline
+            from retrieval.query_cache import get_cached_result, cache_query_result
 
-            result = await retrieval_pipeline(
-                query=body.query,
-                allowed_collections=allowed_collections,
-                image_base64=body.image_base64,
-            )
+            # Check cache first (skip if image query or has chat history)
+            cached_result = None
+            if not body.image_base64 and not chat_history:
+                cached_result = get_cached_result(body.query, allowed_collections)
 
-            # Stream the answer tokens
+            if cached_result:
+                # Serve from cache
+                result = cached_result
+            else:
+                # Execute full pipeline
+                result = await retrieval_pipeline(
+                    query=body.query,
+                    allowed_collections=allowed_collections,
+                    image_base64=body.image_base64,
+                    chat_history=chat_history,
+                )
+
+                # Note: Caching will happen after verification completes
+
+            # Get answer and metadata
             answer = result.get("answer", "")
-            # For now, send the full answer — streaming will be implemented
-            # when the Groq streaming integration is connected
-            yield f"data: {json.dumps({'type': 'token', 'content': answer})}\n\n"
+            citations = result.get("citations", [])
+            cache_hit = result.get("cache_hit", False)
+            related = result.get("related_documents", [])
+
+            # Stream answer tokens immediately (non-blocking)
+            # For now, send the full answer as one token event
+            # TODO: Implement true token-by-token streaming with Groq streaming API
+            yield f"data: {json.dumps({'type': 'answer_token', 'content': answer})}\n\n"
 
             # Send citations
-            citations = result.get("citations", [])
             yield f"data: {json.dumps({'type': 'citations', 'content': citations})}\n\n"
 
-            # Send self-correction status
-            correction_status = result.get("self_correction_status", "VERIFIED")
-            yield f"data: {json.dumps({'type': 'status', 'content': correction_status})}\n\n"
+            # Send cache hit indicator
+            yield f"data: {json.dumps({'type': 'cache_hit', 'content': cache_hit})}\n\n"
 
             # Send related documents
-            related = result.get("related_documents", [])
             yield f"data: {json.dumps({'type': 'related', 'content': related})}\n\n"
+
+            # Run self-correction in background (if not cached)
+            verification_result = {"status": result.get("self_correction_status", "VERIFIED")}
+
+            if not cache_hit and result.get("self_correction_status") == "PENDING":
+                from llm.groq_client import groq_client
+                import asyncio
+
+                loop = asyncio.get_event_loop()
+                formatted_chunks = result.get("formatted_chunks", [])
+                query_text = result.get("query", body.query)
+
+                # Run verification in executor (non-blocking)
+                correction_result = await loop.run_in_executor(
+                    None,
+                    groq_client.verify_answer,
+                    query_text,
+                    answer,
+                    formatted_chunks,
+                )
+
+                outcome = correction_result.get("outcome", "VERIFIED")
+                if outcome == "CORRECTED":
+                    verification_result = {
+                        "status": "CORRECTED",
+                        "amendments": correction_result.get("corrected_answer", ""),
+                    }
+                elif outcome == "INSUFFICIENT_CONTEXT":
+                    verification_result = {
+                        "status": "INSUFFICIENT_CONTEXT",
+                        "message": correction_result.get("explanation", ""),
+                    }
+                else:
+                    verification_result = {"status": "VERIFIED"}
+
+            # Send verification result event
+            yield f"data: {json.dumps({'type': 'verification_result', 'content': verification_result})}\n\n"
+
+            # Cache the final result (if not from image query or chat, and not cached)
+            if not body.image_base64 and not chat_history and not cache_hit:
+                # Update result with final verification status before caching
+                result_to_cache = result.copy()
+                result_to_cache["self_correction_status"] = verification_result.get("status", "VERIFIED")
+                # Remove internal fields not needed for cache
+                result_to_cache.pop("formatted_chunks", None)
+                result_to_cache.pop("query", None)
+                cache_query_result(body.query, allowed_collections, result_to_cache)
 
             # Save assistant message to DB using a fresh session
             # (the original request session is closed by now)
@@ -116,12 +197,14 @@ async def chat_query(
             save_db = SessionLocal()
             try:
                 elapsed_ms = int((time.time() - start_time) * 1000)
+                final_status = verification_result.get("status", "VERIFIED")
+
                 assistant_msg = Message(
                     conversation_id=conversation_id,
                     role="assistant",
                     content=answer,
                     citations=json.dumps(citations),
-                    self_correction_status=correction_status,
+                    self_correction_status=final_status,
                 )
                 save_db.add(assistant_msg)
 
@@ -129,7 +212,7 @@ async def chat_query(
                 query_log = QueryLog(
                     user_id=user_id,
                     query_text=body.query,
-                    answer_status=correction_status,
+                    answer_status=final_status,
                     total_response_time_ms=elapsed_ms,
                     chunks_retrieved=result.get("chunks_retrieved", 0),
                 )

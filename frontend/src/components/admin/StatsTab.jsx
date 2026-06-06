@@ -33,6 +33,11 @@ export default function StatsTab() {
     );
   }
 
+  // Coerce to arrays defensively — an unexpected payload shape must never
+  // throw during render (it would blank the entire app).
+  const topics = Array.isArray(trendingTopics) ? trendingTopics : [];
+  const gaps = Array.isArray(knowledgeGaps) ? knowledgeGaps : [];
+
   return (
     <div className="p-6 space-y-8 max-w-5xl">
       {/* Stat cards */}
@@ -97,11 +102,11 @@ export default function StatsTab() {
             <TrendingUp size={16} className="text-violet-500" />
             <h3 className="text-sm font-semibold text-ink-900">Trending Topics (7 days)</h3>
           </div>
-          {trendingTopics.length === 0 ? (
+          {topics.length === 0 ? (
             <p className="text-xs text-sand-400 py-4 text-center">No data yet</p>
           ) : (
             <div className="space-y-2">
-              {trendingTopics.map((topic, idx) => (
+              {topics.map((topic, idx) => (
                 <div
                   key={idx}
                   className="flex items-center gap-3 py-2 px-3 rounded-lg bg-cream-50"
@@ -127,23 +132,20 @@ export default function StatsTab() {
             <AlertTriangle size={16} className="text-terra-500" />
             <h3 className="text-sm font-semibold text-ink-900">Knowledge Gaps</h3>
           </div>
-          {knowledgeGaps.length === 0 ? (
+          {gaps.length === 0 ? (
             <p className="text-xs text-sand-400 py-4 text-center">
               No gaps detected — great coverage!
             </p>
           ) : (
             <div className="space-y-2">
-              {knowledgeGaps.map((gap, idx) => (
+              {gaps.map((gap, idx) => (
                 <div
                   key={idx}
                   className="flex items-start gap-3 py-2 px-3 rounded-lg bg-terra-500/5 border border-terra-500/10"
                 >
                   <AlertTriangle size={14} className="text-terra-500 mt-0.5 flex-shrink-0" />
                   <div>
-                    <p className="text-sm text-ink-700">{gap.query || gap.topic}</p>
-                    <p className="text-[10px] text-sand-400 mt-0.5">
-                      {gap.count} unanswered queries
-                    </p>
+                    <p className="text-sm text-ink-700">{gap.query_text || gap.query || gap.topic}</p>
                   </div>
                 </div>
               ))}

@@ -12,7 +12,7 @@ export async function createUser(userData) {
 }
 
 export async function updateUser(userId, userData) {
-  const { data } = await api.put(`/api/admin/users/${userId}`, userData);
+  const { data } = await api.patch(`/api/admin/users/${userId}`, userData);
   return data;
 }
 
@@ -33,7 +33,33 @@ export async function getTrendingTopics(days = 7) {
 }
 
 export async function getKnowledgeGaps(days = 30) {
-  const { data } = await api.get('/api/admin/knowledge-gaps', { params: { days } });
+  const { data } = await api.get('/api/admin/knowledge-gaps', { params: { window: days } });
+  return data;
+}
+
+export async function getKnowledgeGapsMatrix(windowDays = 30, minFrequency = 2) {
+  const { data } = await api.get('/api/admin/knowledge-gaps', {
+    params: { window: windowDays, min_frequency: minFrequency },
+  });
+  return data;
+}
+
+export async function getGapDetail(topic, windowDays = 30) {
+  const { data } = await api.get(`/api/admin/knowledge-gaps/detail/${encodeURIComponent(topic)}`, {
+    params: { window: windowDays },
+  });
+  return data;
+}
+
+export async function resolveGapTopic(topic) {
+  const { data } = await api.patch(
+    `/api/admin/knowledge-gaps/${encodeURIComponent(topic)}/resolve`
+  );
+  return data;
+}
+
+export async function recomputeSimilarityMap() {
+  const { data } = await api.post('/api/admin/recompute-similarity-map');
   return data;
 }
 

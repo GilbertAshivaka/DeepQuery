@@ -177,4 +177,22 @@
            prose-th:bg-cream-100 prose-th:text-ink-900
            prose-td:border-cream-200;
   }
+
+  /* PDF white background for better rendering */
+  .react-pdf__Page canvas {
+    background: white !important;
+  }
+
+  .react-pdf__Page {
+    background: white;
+  }
+
+  /* Fix invisible white text in PDF SVG rendering */
+  .react-pdf__Page svg text {
+    fill: black !important;
+  }
+
+  .react-pdf__Page svg tspan {
+    fill: black !important;
+  }
 }

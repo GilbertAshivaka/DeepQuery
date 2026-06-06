@@ -90,11 +90,35 @@ export const useChatStore = create((set, get) => ({
         const last = { ...updated[lastIdx] };
 
         // Handle backend SSE event types: {type, content}
-        if (chunk.type === 'token') {
+        if (chunk.type === 'answer_token') {
+          // NEW: answer_token event (replaces old 'token')
+          last.content += chunk.content || '';
+        } else if (chunk.type === 'token') {
+          // LEGACY: support old token event for backwards compatibility
           last.content += chunk.content || '';
         } else if (chunk.type === 'citations') {
           last.sources = chunk.content || [];
+        } else if (chunk.type === 'verification_result') {
+          // NEW: verification result from non-blocking self-correction
+          const status = chunk.content?.status || 'VERIFIED';
+          last.metadata = {
+            ...last.metadata,
+            self_correction_status: status,
+            verification_result: chunk.content,
+          };
+          // If corrected, show amendments
+          if (status === 'CORRECTED' && chunk.content?.amendments) {
+            last.content += '\n\n---\n**Corrections Applied:**\n' + chunk.content.amendments;
+          }
+          // If insufficient context, show message
+          if (status === 'INSUFFICIENT_CONTEXT' && chunk.content?.message) {
+            last.content += '\n\n---\n⚠️ ' + chunk.content.message;
+          }
+        } else if (chunk.type === 'cache_hit') {
+          // NEW: cache hit indicator
+          last.metadata = { ...last.metadata, cache_hit: chunk.content };
         } else if (chunk.type === 'status') {
+          // LEGACY: old status event
           last.metadata = { ...last.metadata, self_correction_status: chunk.content };
         } else if (chunk.type === 'related') {
           last.metadata = { ...last.metadata, related_documents: chunk.content };

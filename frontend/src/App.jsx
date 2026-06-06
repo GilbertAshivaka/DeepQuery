@@ -7,6 +7,8 @@ import ChatPage from './pages/ChatPage';
 import SearchPage from './pages/SearchPage';
 import AdminPage from './pages/AdminPage';
 import DocumentViewerPage from './pages/DocumentViewerPage';
+import KnowledgeGraphPage from './pages/KnowledgeGraphPage';
+import CorpusExplorerPage from './pages/CorpusExplorerPage';
 
 function ProtectedRoute({ children, roles }) {
   const { user, isAuthenticated } = useAuthStore();
@@ -65,6 +67,22 @@ export default function App() {
         <Route path="chat/:conversationId" element={<ChatPage />} />
         <Route path="search" element={<SearchPage />} />
         <Route path="documents/:id" element={<DocumentViewerPage />} />
+        <Route
+          path="graph"
+          element={
+            <ProtectedRoute roles={['admin', 'researcher']}>
+              <KnowledgeGraphPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="corpus"
+          element={
+            <ProtectedRoute roles={['admin', 'researcher']}>
+              <CorpusExplorerPage />
+            </ProtectedRoute>
+          }
+        />
         <Route
           path="admin"
           element={
