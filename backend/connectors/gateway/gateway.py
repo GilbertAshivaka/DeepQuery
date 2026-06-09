@@ -1,0 +1,432 @@
+"""The Connector Gateway — every connector call passes through here.
+
+Phase 1 scope (guide §15): **routing + audit logging**, with basic timeout and
+error isolation so one slow/failing connector can't stall a query. Allowlist
+enforcement (Phase 3), credential injection (Phase 2), and action gating
+(Phase 4) attach at this same chokepoint later.
+
+The Gateway is async (MCP is anyio-based); synchronous DB work (registry lookups,
+audit writes) is offloaded to threads so it never blocks the event loop.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from typing import Any, Optional
+
+from connectors.cache import cache_get, cache_set
+from connectors.citations import build_live_citations, build_resource_citation
+from connectors.credentials.store import InjectedCredential, credential_store
+from connectors.gateway.action_gate import ActionGateError, action_gate
+from connectors.gateway.audit import record_call
+from connectors.gateway.deployment import DeploymentError, assert_connector_permitted
+from connectors.gateway.health import CircuitOpenError, circuit_breaker
+from connectors.gateway.registry import ConnectorRef, get_connector_ref
+from connectors.governance import GovernanceError, check_access
+from connectors.mcp_client.client import MCPConnectorClient, MCPClientError
+from connectors.mcp_client.transports import STDIO, TransportConfig
+from connectors.mcp_client.types import Discovery
+from core.database import SessionLocal
+
+
+class GatewayError(Exception):
+    """A connector call could not be completed; carries a user-legible message."""
+
+
+class ConnectorNotFoundError(GatewayError):
+    """The requested connector is not registered."""
+
+
+class ConnectorGateway:
+    def __init__(self, *, timeout_s: float = 30.0) -> None:
+        self.timeout_s = timeout_s
+
+    # -- routing ----------------------------------------------------------
+    async def _resolve(self, *, connector_id: Optional[str], name: Optional[str]) -> ConnectorRef:
+        ref = await asyncio.to_thread(self._load_ref, connector_id, name)
+        if ref is None:
+            raise ConnectorNotFoundError(f"connector not found: {connector_id or name!r}")
+        return ref
+
+    @staticmethod
+    def _load_ref(connector_id: Optional[str], name: Optional[str]) -> Optional[ConnectorRef]:
+        db = SessionLocal()
+        try:
+            return get_connector_ref(db, connector_id=connector_id, name=name)
+        finally:
+            db.close()
+
+    # -- governance enforcement (guide §9) --------------------------------
+    @staticmethod
+    def _check_governance(ref: ConnectorRef, user_id: str) -> None:
+        """Refuse the call unless the user may use this connector (approved +
+        role-permitted + version-compatible + enabled). Runs sync; call in a thread."""
+        db = SessionLocal()
+        try:
+            check_access(db, user_id=user_id, connector_ref=ref)
+        except GovernanceError as exc:
+            raise GatewayError(str(exc)) from exc
+        finally:
+            db.close()
+
+    # -- deployment mode + circuit breaker (guide §11, §12) ---------------
+    @staticmethod
+    def _assert_deployment(ref: ConnectorRef) -> None:
+        """Refuse a connector not permissible under the current deployment mode
+        (e.g. a network connector in air-gapped mode)."""
+        try:
+            assert_connector_permitted(ref)
+        except DeploymentError as exc:
+            raise GatewayError(str(exc)) from exc
+
+    @staticmethod
+    def _breaker_check(ref: ConnectorRef) -> None:
+        """Fast-fail if the connector's circuit is open (repeated failures)."""
+        try:
+            circuit_breaker.check(ref.name)
+        except CircuitOpenError as exc:
+            raise GatewayError(
+                f"the '{ref.name}' connector is temporarily unavailable "
+                f"(circuit open after repeated failures); try again shortly"
+            ) from exc
+
+    @staticmethod
+    def _audit_action(ref, capability, phase, outcome, user_id, approver_id, error) -> None:
+        db = SessionLocal()
+        try:
+            record_call(
+                db, connector_id=ref.id, connector_name=ref.name, capability_name=capability,
+                kind="action", action_phase=phase, approved_by=approver_id, outcome=outcome,
+                user_id=user_id, error_message=error,
+            )
+        finally:
+            db.close()
+
+    def health(self, connector_name: str) -> dict[str, Any]:
+        return circuit_breaker.health(connector_name)
+
+    # -- per-user credential injection (guide §6) -------------------------
+    @staticmethod
+    def _resolve_credential(ref: ConnectorRef, user_id: Optional[str]) -> Optional[InjectedCredential]:
+        """Resolve (and transparently refresh) the requesting user's credential
+        for this connector. Runs sync DB + httpx, so call it via a thread."""
+        if user_id is None:
+            return None
+        db = SessionLocal()
+        try:
+            return credential_store.resolve_injected(db, user_id=user_id, connector_ref=ref)
+        finally:
+            db.close()
+
+    async def _make_client(self, ref: ConnectorRef, user_id: Optional[str]) -> MCPConnectorClient:
+        """Build an MCP client for the connector, injecting the requesting user's
+        credential (stdio -> env vars; http/sse -> Authorization header)."""
+        injected = await asyncio.to_thread(self._resolve_credential, ref, user_id)
+        if ref.auth_method != "none" and injected is None:
+            raise GatewayError(
+                f"you have not connected your '{ref.name}' account; enable the connector first."
+            )
+        config = TransportConfig.from_registry(name=ref.name, transport=ref.transport, endpoint=ref.endpoint)
+        if injected is not None:
+            if ref.transport == STDIO:
+                config.env = {**(config.env or {}), **injected.env()}
+            else:  # sse / http
+                config.headers = {**(config.headers or {}), **injected.headers()}
+        return MCPConnectorClient(config, timeout_s=self.timeout_s)
+
+    # -- discovery (not audited; a capability handshake, not a data call) --
+    async def discover(
+        self, *, connector_id: Optional[str] = None, name: Optional[str] = None, user_id: Optional[str] = None
+    ) -> tuple[ConnectorRef, Discovery]:
+        """Discover a connector's full advertised capability set across all MCP
+        primitives (tools, resources, prompts)."""
+        ref = await self._resolve(connector_id=connector_id, name=name)
+        self._assert_deployment(ref)
+        client = await self._make_client(ref, user_id)
+        try:
+            discovery = await client.discover()
+        except MCPClientError as exc:
+            raise GatewayError(f"the '{ref.name}' connector is unavailable: {exc}") from exc
+        return ref, discovery
+
+    # -- read path --------------------------------------------------------
+    async def read(
+        self,
+        *,
+        capability: str,
+        arguments: Optional[dict[str, Any]] = None,
+        connector_id: Optional[str] = None,
+        name: Optional[str] = None,
+        user_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+        enforce_governance: bool = True,
+    ) -> dict[str, Any]:
+        """Route a read to the right connector, enforcing governance, serving from
+        the ephemeral cache when possible, auditing, and returning records +
+        timestamped live citations.
+
+        `enforce_governance=False` is for trusted system/agentless calls that have
+        no requesting user; real agent calls always enforce it.
+        """
+        ref = await self._resolve(connector_id=connector_id, name=name)
+
+        # 1. Governance: allowlist + role + version + enablement (guide §9).
+        if enforce_governance and user_id is not None:
+            await asyncio.to_thread(self._check_governance, ref, user_id)
+
+        # 2. Deployment-mode egress policy (guide §11).
+        self._assert_deployment(ref)
+
+        # 3. Ephemeral cache (reads only, per-connector TTL, user+conversation scoped).
+        cache_enabled = ref.cache_ttl_seconds > 0
+        if cache_enabled:
+            cached = await asyncio.to_thread(
+                cache_get, connector=ref.name, capability=capability, arguments=arguments,
+                user_id=user_id, conversation_id=conversation_id,
+            )
+            if cached is not None:
+                await asyncio.to_thread(self._audit, ref, capability, "success", user_id, None, 0)
+                return {**cached, "cache_hit": True}
+
+        # 4. Circuit breaker, then inject the user's credential and call the connector.
+        self._breaker_check(ref)
+        client = await self._make_client(ref, user_id)
+        started = time.perf_counter()
+        try:
+            result = await client.read(capability, arguments or {})
+        except MCPClientError as exc:
+            circuit_breaker.record_failure(ref.name, str(exc))
+            latency = int((time.perf_counter() - started) * 1000)
+            await asyncio.to_thread(self._audit, ref, capability, "error", user_id, str(exc), latency)
+            raise GatewayError(f"the '{ref.name}' connector is unavailable: {exc}") from exc
+
+        circuit_breaker.record_success(ref.name)
+        latency = int((time.perf_counter() - started) * 1000)
+        await asyncio.to_thread(self._audit, ref, capability, "success", user_id, None, latency)
+
+        citations = build_live_citations(ref.name, result.records)
+        payload = {
+            "connector": ref.name,
+            "capability": capability,
+            "has_sdk_provenance": result.has_sdk_provenance,
+            "records": [{"data": r.data, "provenance": r.provenance} for r in result.records],
+            "citations": [c.to_dict() for c in citations],
+            "latency_ms": latency,
+            "cache_hit": False,
+        }
+
+        # 4. Populate the cache (the stored copy keeps cache_hit=False until served).
+        if cache_enabled:
+            await asyncio.to_thread(
+                cache_set, connector=ref.name, capability=capability, arguments=arguments,
+                user_id=user_id, conversation_id=conversation_id, value=payload, ttl_seconds=ref.cache_ttl_seconds,
+            )
+        return payload
+
+    # -- resources & prompts (the other two MCP primitives) ---------------
+    async def read_resource(
+        self,
+        *,
+        uri: str,
+        connector_id: Optional[str] = None,
+        name: Optional[str] = None,
+        user_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+        enforce_governance: bool = True,
+    ) -> dict[str, Any]:
+        """Read an MCP resource by URI — same policy path as a tool read, with a
+        URI-based live citation so the content stays citeable."""
+        ref = await self._resolve(connector_id=connector_id, name=name)
+        if enforce_governance and user_id is not None:
+            await asyncio.to_thread(self._check_governance, ref, user_id)
+        self._assert_deployment(ref)
+
+        cap = f"resource:{uri}"[:200]
+        cache_enabled = ref.cache_ttl_seconds > 0
+        if cache_enabled:
+            cached = await asyncio.to_thread(
+                cache_get, connector=ref.name, capability="__resource__", arguments={"uri": uri},
+                user_id=user_id, conversation_id=conversation_id,
+            )
+            if cached is not None:
+                await asyncio.to_thread(self._audit, ref, cap, "success", user_id, None, 0)
+                return {**cached, "cache_hit": True}
+
+        self._breaker_check(ref)
+        client = await self._make_client(ref, user_id)
+        started = time.perf_counter()
+        try:
+            contents = await client.read_resource(uri)
+        except MCPClientError as exc:
+            circuit_breaker.record_failure(ref.name, str(exc))
+            latency = int((time.perf_counter() - started) * 1000)
+            await asyncio.to_thread(self._audit, ref, cap, "error", user_id, str(exc), latency)
+            raise GatewayError(f"the '{ref.name}' connector is unavailable: {exc}") from exc
+
+        circuit_breaker.record_success(ref.name)
+        latency = int((time.perf_counter() - started) * 1000)
+        await asyncio.to_thread(self._audit, ref, cap, "success", user_id, None, latency)
+
+        payload = {
+            "connector": ref.name,
+            "uri": uri,
+            "contents": [
+                {"uri": c.uri, "mime_type": c.mime_type, "text": c.text, "blob_base64": c.blob_base64}
+                for c in contents
+            ],
+            "citations": [
+                build_resource_citation(ref.name, uri=c.uri, mime_type=c.mime_type).to_dict() for c in contents
+            ],
+            "latency_ms": latency,
+            "cache_hit": False,
+        }
+        if cache_enabled:
+            await asyncio.to_thread(
+                cache_set, connector=ref.name, capability="__resource__", arguments={"uri": uri},
+                user_id=user_id, conversation_id=conversation_id, value=payload, ttl_seconds=ref.cache_ttl_seconds,
+            )
+        return payload
+
+    async def get_prompt(
+        self,
+        *,
+        prompt_name: str,
+        arguments: Optional[dict[str, str]] = None,
+        connector_id: Optional[str] = None,
+        name: Optional[str] = None,
+        user_id: Optional[str] = None,
+        enforce_governance: bool = True,
+    ) -> dict[str, Any]:
+        """Fetch an MCP prompt template. Prompt content is an injection surface, so
+        it is returned marked untrusted (guide §12) — never executed as instructions."""
+        ref = await self._resolve(connector_id=connector_id, name=name)
+        if enforce_governance and user_id is not None:
+            await asyncio.to_thread(self._check_governance, ref, user_id)
+        self._assert_deployment(ref)
+        self._breaker_check(ref)
+        client = await self._make_client(ref, user_id)
+        cap = f"prompt:{prompt_name}"[:200]
+        started = time.perf_counter()
+        try:
+            result = await client.get_prompt(prompt_name, arguments or {})
+        except MCPClientError as exc:
+            circuit_breaker.record_failure(ref.name, str(exc))
+            await asyncio.to_thread(
+                self._audit, ref, cap, "error", user_id, str(exc), int((time.perf_counter() - started) * 1000)
+            )
+            raise GatewayError(f"the '{ref.name}' connector is unavailable: {exc}") from exc
+
+        circuit_breaker.record_success(ref.name)
+        await asyncio.to_thread(
+            self._audit, ref, cap, "success", user_id, None, int((time.perf_counter() - started) * 1000)
+        )
+        return {
+            "connector": ref.name,
+            "prompt": prompt_name,
+            "description": result.description,
+            "messages": [{"role": m.role, "text": m.text} for m in result.messages],
+            "untrusted": True,
+        }
+
+    # -- gated action lifecycle (guide §5, §12) ---------------------------
+    async def preview_action(
+        self,
+        *,
+        capability: str,
+        arguments: Optional[dict[str, Any]] = None,
+        connector_id: Optional[str] = None,
+        name: Optional[str] = None,
+        user_id: Optional[str] = None,
+        enforce_governance: bool = True,
+    ) -> dict[str, Any]:
+        """Preview an action (no execution) and open a pending-approval record."""
+        ref = await self._resolve(connector_id=connector_id, name=name)
+        if enforce_governance and user_id is not None:
+            await asyncio.to_thread(self._check_governance, ref, user_id)
+        self._assert_deployment(ref)
+        self._breaker_check(ref)
+        client = await self._make_client(ref, user_id)
+        try:
+            preview = await client.preview_action(capability, arguments or {})
+        except MCPClientError as exc:
+            circuit_breaker.record_failure(ref.name, str(exc))
+            await asyncio.to_thread(self._audit_action, ref, capability, "preview", "error", user_id, None, str(exc))
+            raise GatewayError(f"the '{ref.name}' connector is unavailable: {exc}") from exc
+        circuit_breaker.record_success(ref.name)
+        pending_id = await asyncio.to_thread(
+            action_gate.request, connector_id=ref.id, connector_name=ref.name,
+            capability=capability, arguments=arguments, user_id=user_id, preview=preview,
+        )
+        await asyncio.to_thread(self._audit_action, ref, capability, "preview", "success", user_id, None, None)
+        return {"pending_id": pending_id, "connector": ref.name, "capability": capability, "preview": preview}
+
+    async def approve_action(self, *, pending_id: str, approver_id: str) -> dict[str, Any]:
+        """Issue an approval token (the Agent Layer calls this after a human confirms)."""
+        try:
+            token = await asyncio.to_thread(action_gate.approve, pending_id, approver_id)
+        except ActionGateError as exc:
+            raise GatewayError(str(exc)) from exc
+        return {"pending_id": pending_id, "approval_token": token}
+
+    async def reject_action(self, *, pending_id: str, approver_id: str) -> dict[str, Any]:
+        try:
+            await asyncio.to_thread(action_gate.reject, pending_id, approver_id)
+        except ActionGateError as exc:
+            raise GatewayError(str(exc)) from exc
+        return {"pending_id": pending_id, "status": "rejected"}
+
+    async def execute_action(self, *, pending_id: str, approval_token: str, user_id: Optional[str] = None) -> dict[str, Any]:
+        """Execute a previewed action — refused unless it carries a valid approval
+        token (the enforcement). Forwards execute to the connector and audits the
+        approver."""
+        try:
+            rec = await asyncio.to_thread(action_gate.consume_for_execute, pending_id, approval_token)
+        except ActionGateError as exc:
+            raise GatewayError(str(exc)) from exc
+
+        ref = await self._resolve(connector_id=rec["connector_id"], name=None)
+        self._assert_deployment(ref)
+        self._breaker_check(ref)
+        client = await self._make_client(ref, rec.get("user_id") or user_id)
+        try:
+            result = await client.execute_gated_action(rec["capability"], rec["arguments"])
+        except MCPClientError as exc:
+            circuit_breaker.record_failure(ref.name, str(exc))
+            await asyncio.to_thread(
+                self._audit_action, ref, rec["capability"], "execute", "error",
+                rec.get("user_id"), rec.get("approver_id"), str(exc),
+            )
+            raise GatewayError(f"the '{ref.name}' connector is unavailable: {exc}") from exc
+        circuit_breaker.record_success(ref.name)
+        await asyncio.to_thread(
+            self._audit_action, ref, rec["capability"], "execute", "success",
+            rec.get("user_id"), rec.get("approver_id"), None,
+        )
+        return {"status": "executed", "result": result, "approved_by": rec.get("approver_id")}
+
+    # -- audit helper (sync, runs in a thread) ----------------------------
+    @staticmethod
+    def _audit(
+        ref: ConnectorRef,
+        capability: str,
+        outcome: str,
+        user_id: Optional[str],
+        error: Optional[str],
+        latency_ms: int,
+    ) -> None:
+        db = SessionLocal()
+        try:
+            record_call(
+                db,
+                connector_id=ref.id,
+                connector_name=ref.name,
+                capability_name=capability,
+                kind="read",
+                outcome=outcome,
+                user_id=user_id,
+                error_message=error,
+                latency_ms=latency_ms,
+            )
+        finally:
+            db.close()

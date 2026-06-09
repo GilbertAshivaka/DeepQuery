@@ -25,6 +25,11 @@ langchain-google-genai>=2.0.8,<3.0
 langchain-groq>=0.2.4,<0.3
 langchain-text-splitters>=0.3.4,<0.4
 
+# ── Agent Layer (orchestration) ──
+# LangGraph drives the orchestrator graph (intent classify → delegate → verify) and
+# the approval-gate interrupt/resume. Sits on top of langchain-core.
+langgraph>=0.2,<0.3
+
 # ── Embedding & LLM APIs ──
 google-generativeai==0.8.4
 groq==0.13.1
@@ -59,7 +64,8 @@ redis==5.2.1
 
 # ── Utilities ──
 python-dotenv==1.0.1
-pydantic==2.10.4
+# pydantic >=2.11 required by the `mcp` SDK (connector layer); 2.x is backward-compatible.
+pydantic>=2.11,<3
 pydantic-settings==2.7.1
 httpx==0.28.1
 
@@ -74,3 +80,8 @@ numpy>=1.26.0
 
 # ── Dimensionality Reduction (Document Similarity Map) ──
 umap-learn>=0.5.6
+
+# ── Connector Infrastructure (live data layer) ──
+# DeepQuerySDK — the connector dev kit; pulls in the official `mcp` SDK used by
+# Deep Query's MCP client to speak to every connector.
+deepquery-sdk>=1,<2

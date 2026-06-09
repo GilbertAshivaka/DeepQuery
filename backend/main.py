@@ -3,7 +3,17 @@ Deep Query — FastAPI Application Entry Point
 """
 
 import logging
+import sys
 from contextlib import asynccontextmanager
+
+# Ensure console output can encode Unicode (✓, ○, …) even when the host console
+# defaults to a legacy code page (e.g. cp1252 on Windows). Without this, the
+# startup status prints can raise UnicodeEncodeError and abort the server.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

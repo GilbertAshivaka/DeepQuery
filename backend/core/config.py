@@ -41,6 +41,29 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     llm_model: str = "llama-3.3-70b-versatile"
 
+    # ── Agent Layer — Model Slots ───────────────────────────
+    # Per-slot provider + model for the agent layer (orchestration / generation /
+    # verification). Default: GPT-OSS-120B via Groq everywhere (under evaluation —
+    # Gemini 2.5 Flash free-tier caps proved too tight). The existing chat RAG path
+    # is unaffected; it keeps using llm_model above.
+    # Providers: google | groq | anthropic | ollama | vllm. Air-gapped mode forbids
+    # cloud providers and requires a local backend for every slot (enforced).
+    agent_orchestration_provider: str = "groq"
+    agent_orchestration_model: str = "openai/gpt-oss-120b"
+    agent_generation_provider: str = "groq"
+    agent_generation_model: str = "openai/gpt-oss-120b"
+    agent_verification_provider: str = "groq"
+    agent_verification_model: str = "openai/gpt-oss-120b"
+
+    # Optional backends for non-default slots.
+    anthropic_api_key: str = ""
+    ollama_base_url: str = "http://localhost:11434"
+
+    # How long (seconds) the agent layer caches a connector's discovered tool list
+    # before re-discovering. Tool lists rarely change between queries; caching avoids
+    # a subprocess/network round-trip per query. 0 disables the cache.
+    agent_discovery_cache_ttl_seconds: int = 600
+
     # ── ChromaDB ─────────────────────────────────────────────
     chroma_persist_directory: str = "./chroma_data"
     chroma_host: str = "localhost"
@@ -60,6 +83,18 @@ class Settings(BaseSettings):
     # ── Celery / Redis ───────────────────────────────────────
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_result_backend: str = "redis://localhost:6379/1"
+
+    # ── Connector Infrastructure ─────────────────────────────
+    # Fernet key for encrypting per-user connector credentials at rest. Generate
+    # with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # If empty, a volatile dev key is generated at startup (credentials won't
+    # survive a restart) — set this in production.
+    connector_encryption_key: str = ""
+    # Base URL the OAuth provider redirects back to after user consent.
+    connector_oauth_redirect_base: str = "http://localhost:8000"
+    # Deployment mode: cloud | hybrid | air-gapped. Air-gapped permits only
+    # self-hosted (stdio, no-network) connectors and forbids external egress/OAuth.
+    deployment_mode: str = "cloud"
 
     # ── Document Storage ─────────────────────────────────────
     document_store_path: str = "./document_store"

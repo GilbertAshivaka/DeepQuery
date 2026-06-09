@@ -62,6 +62,11 @@ def init_db():
         Message,
         RefreshToken,
         QueryLog,
+        Connector,
+        ConnectorAuditLog,
+        ConnectorCredential,
+        ConnectorApproval,
+        UserConnectorEnablement,
     )
 
     Base.metadata.create_all(bind=engine)

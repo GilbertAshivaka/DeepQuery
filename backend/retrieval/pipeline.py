@@ -73,23 +73,26 @@ def apply_cosine_similarity_filter(
     return sorted_by_similarity[: min_candidates * 2]
 
 
-async def retrieval_pipeline(
+async def gather_context(
     query: str,
     allowed_collections: List[str],
     image_base64: Optional[str] = None,
     chat_history: Optional[list] = None,
 ) -> Dict[str, Any]:
-    """Execute the full retrieval + generation pipeline with parallel execution.
+    """Run the retrieval-only path (no answer generation).
 
-    Args:
-        query: User's natural-language question.
-        allowed_collections: ChromaDB collections the user can access.
-        image_base64: Optional base64 image for multimodal query.
-        chat_history: Previous conversation turns for context.
+    Embed → hybrid retrieve (dense + BM25) → RRF fuse → pre-filter → rerank →
+    format chunks → build document citations, plus knowledge-graph context.
+
+    Shared by two callers:
+    - ``retrieval_pipeline`` (the chat path), which then generates with Groq/Llama.
+    - the Agent Layer's Retrieval Sub-Agent, which assembles dual-source context and
+      lets the Orchestrator drive generation via its own model slot.
 
     Returns:
-        dict with 'answer', 'citations', 'self_correction_status',
-        'related_documents', 'chunks_retrieved'.
+        dict with 'formatted_chunks', 'citations', 'graph_context',
+        'chunks_retrieved', 'query', 'retrieval_time_ms' — or {'error': str} if the
+        query could not be embedded.
     """
     from embeddings.gemini_embedder import gemini_embedder
     from knowledge_graph.neo4j_client import neo4j_client
@@ -143,13 +146,7 @@ async def retrieval_pipeline(
     )
 
     if query_embedding is None:
-        return {
-            "answer": "I'm sorry, I encountered an error processing your query. Please try again.",
-            "citations": [],
-            "self_correction_status": "ERROR",
-            "related_documents": [],
-            "chunks_retrieved": 0,
-        }
+        return {"error": "query_embedding_failed"}
 
     # ── GROUP B: Parallel execution (dense search, graph traversal) ──
     logger.info("Group B: Dense retrieval, graph traversal (parallel)")
@@ -227,23 +224,7 @@ async def retrieval_pipeline(
             "relevance_score": relevance,
         })
 
-    # ── GROUP D: RAG generation (self-correction will be non-blocking) ──
-    logger.info("Group D: RAG generation")
-
-    # RAG generation
-    answer = await loop.run_in_executor(
-        None,
-        groq_client.generate_answer,
-        query,
-        formatted_chunks,
-        graph_context,
-        chat_history,
-    )
-
-    if answer is None:
-        answer = "I'm sorry, I was unable to generate an answer. Please try again."
-
-    # ── Build citations ──────────────────────────────────────
+    # ── Build document citations ─────────────────────────────
     citations = []
     for i, chunk in enumerate(formatted_chunks, 1):
         citations.append({
@@ -256,18 +237,72 @@ async def retrieval_pipeline(
         })
 
     elapsed = time.time() - start
-    logger.info(f"Retrieval pipeline completed in {elapsed:.2f}s")
+    logger.info(f"Context gathering completed in {elapsed:.2f}s")
 
-    # Return answer and data for self-correction (to be done by endpoint)
+    return {
+        "formatted_chunks": formatted_chunks,
+        "citations": citations,
+        "graph_context": graph_context,
+        "chunks_retrieved": len(context_chunks),
+        "query": query,
+        "retrieval_time_ms": int(elapsed * 1000),
+    }
+
+
+async def retrieval_pipeline(
+    query: str,
+    allowed_collections: List[str],
+    image_base64: Optional[str] = None,
+    chat_history: Optional[list] = None,
+) -> Dict[str, Any]:
+    """Execute the full retrieval + generation pipeline (the chat path).
+
+    Gathers context via ``gather_context`` then generates the answer with the
+    Groq/Llama client — unchanged behavior for the existing chat endpoint.
+
+    Returns:
+        dict with 'answer', 'citations', 'formatted_chunks', 'query',
+        'self_correction_status', 'related_documents', 'chunks_retrieved',
+        'retrieval_time_ms'.
+    """
+    from llm.groq_client import groq_client
+
+    ctx = await gather_context(query, allowed_collections, image_base64, chat_history)
+
+    if ctx.get("error"):
+        return {
+            "answer": "I'm sorry, I encountered an error processing your query. Please try again.",
+            "citations": [],
+            "self_correction_status": "ERROR",
+            "related_documents": [],
+            "chunks_retrieved": 0,
+        }
+
+    formatted_chunks = ctx["formatted_chunks"]
+
+    # RAG generation (Groq/Llama) — runs in executor to stay non-blocking.
+    loop = asyncio.get_event_loop()
+    answer = await loop.run_in_executor(
+        None,
+        groq_client.generate_answer,
+        query,
+        formatted_chunks,
+        ctx["graph_context"],
+        chat_history,
+    )
+
+    if answer is None:
+        answer = "I'm sorry, I was unable to generate an answer. Please try again."
+
     return {
         "answer": answer,
-        "citations": citations,
+        "citations": ctx["citations"],
         "formatted_chunks": formatted_chunks,  # For self-correction
         "query": query,  # For self-correction
         "self_correction_status": "PENDING",  # Will be verified in background
         "related_documents": [],
-        "chunks_retrieved": len(context_chunks),
-        "retrieval_time_ms": int(elapsed * 1000),
+        "chunks_retrieved": ctx["chunks_retrieved"],
+        "retrieval_time_ms": ctx["retrieval_time_ms"],
     }
 
 
