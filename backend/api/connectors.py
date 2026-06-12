@@ -43,7 +43,7 @@ from connectors.governance import (
 from core.config import settings
 from core.constants import UserRole
 from core.database import get_db
-from models.database import User
+from models.database import Connector, ConnectorAuditLog, User
 
 router = APIRouter()
 
@@ -178,15 +178,47 @@ def register(
     )
 
 
+@router.delete("/{connector_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_connector(
+    connector_id: str,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(admin_only),
+):
+    """Delete a connector from the registry entirely (admin). Purges its allowlist
+    entry, every user enablement, and stored credentials, then removes the connector.
+    Its audit-log rows are detached (connector_id → NULL) so the FK doesn't block the
+    delete while the trail is preserved via the stored connector name.
+
+    Use revoke (`DELETE /{id}/approve`) to keep a connector but drop access; use this
+    to remove it from the directory entirely."""
+    ref = get_connector_ref(db, connector_id=connector_id)
+    if ref is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connector not found.")
+    # Purge governance (allowlist + enablements + credentials).
+    revoke_approval(db, connector_id=connector_id)
+    # Detach audit rows so the FK doesn't block deletion (trail kept via name).
+    db.query(ConnectorAuditLog).filter(
+        ConnectorAuditLog.connector_id == connector_id
+    ).update({ConnectorAuditLog.connector_id: None}, synchronize_session=False)
+    conn = db.query(Connector).filter(Connector.id == connector_id).first()
+    if conn is not None:
+        db.delete(conn)
+    db.commit()
+
+
 @router.post("/{connector_id}/discover", response_model=DiscoveryOut)
 async def discover(
     connector_id: str,
-    _user: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Discover a connector's full advertised capability set over MCP — tools,
-    resources, and prompts (each probed only if the server declares it)."""
+    resources, and prompts (each probed only if the server declares it).
+
+    Passes the caller's id so the Gateway injects their credential — OAuth-protected
+    servers (e.g. Linear) reject the handshake without a token. No-auth servers are
+    unaffected."""
     try:
-        _ref, d = await gateway.discover(connector_id=connector_id)
+        _ref, d = await gateway.discover(connector_id=connector_id, user_id=user.id)
     except ConnectorNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connector not found.")
     except GatewayError as exc:
@@ -365,6 +397,104 @@ def credential_status(
     """Whether this user has a stored credential for the connector."""
     connected = credential_store.has_credential(db, user_id=user.id, connector_id=connector_id)
     return CredentialStatusResponse(connector_id=connector_id, connected=connected)
+
+
+# ── OAuth auto-configuration (discovery + dynamic client registration) ──
+class OAuthAutoConfigRequest(BaseModel):
+    scopes: Optional[List[str]] = Field(
+        default=None, description="Override discovered scopes; null = use the server's advertised scopes."
+    )
+    client_name: str = Field(default="DeepQuery", description="Client name to register via DCR.")
+
+
+@router.post("/{connector_id}/oauth/autoconfigure")
+def oauth_autoconfigure(
+    connector_id: str,
+    body: OAuthAutoConfigRequest,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(admin_only),
+):
+    """Auto-configure OAuth for a spec-compliant MCP server so the admin only needs
+    the server URL: discover its endpoints + scopes, and — when the server supports
+    Dynamic Client Registration — register a client automatically. Stores the result
+    as the connector's auth_config (client secret encrypted, never returned). Servers
+    without DCR (e.g. GitHub/Atlassian) return needs_manual_client=true with the
+    endpoints pre-filled, so the admin only adds a client id/secret."""
+    import json
+    import logging
+
+    from connectors.credentials import oauth_discovery as disc
+    from connectors.gateway.deployment import is_air_gapped
+
+    ref = get_connector_ref(db, connector_id=connector_id)
+    if ref is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connector not found.")
+    if is_air_gapped():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="external OAuth discovery is unavailable in air-gapped mode.")
+
+    endpoint = ref.endpoint if isinstance(ref.endpoint, dict) else json.loads(ref.endpoint or "{}")
+    url = endpoint.get("url")
+    if not url:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="this connector has no URL (stdio connectors don't use OAuth discovery).")
+
+    try:
+        meta = disc.discover_metadata(url)
+    except disc.DiscoveryError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+    scopes = body.scopes if body.scopes is not None else meta["scopes_supported"]
+    cfg: Dict[str, Any] = {
+        "authorize_endpoint": meta["authorize_endpoint"],
+        "token_endpoint": meta["token_endpoint"],
+        "scopes": scopes,
+        "registration_endpoint": meta.get("registration_endpoint"),
+        "issuer": meta.get("issuer"),
+    }
+
+    needs_manual = True
+    client_id = None
+    if meta["supports_dcr"]:
+        try:
+            reg = disc.register_dynamic_client(
+                meta["registration_endpoint"],
+                redirect_uri=oauth_flow._redirect_uri(),
+                client_name=body.client_name,
+                scopes=scopes,
+            )
+            cfg["client_id"] = reg["client_id"]
+            cfg["token_endpoint_auth_method"] = reg["token_endpoint_auth_method"]
+            if reg.get("client_secret"):
+                cfg["client_secret_enc"] = encrypt(reg["client_secret"])
+            client_id = reg["client_id"]
+            needs_manual = False
+        except disc.DiscoveryError as exc:
+            logging.getLogger(__name__).warning("DCR failed for %s, falling back to manual: %s", ref.name, exc)
+
+    # Persist onto the connector (merge with any existing manual fields).
+    conn = db.query(Connector).filter(Connector.id == connector_id).first()
+    existing = json.loads(conn.auth_config) if conn.auth_config else {}
+    existing.update(cfg)
+    conn.auth_config = json.dumps(existing)
+    conn.auth_method = "oauth2"
+    db.commit()
+
+    return {
+        "discovered": True,
+        "authorize_endpoint": cfg["authorize_endpoint"],
+        "token_endpoint": cfg["token_endpoint"],
+        "scopes": scopes,
+        "supports_dcr": meta["supports_dcr"],
+        "client_id": client_id,
+        "needs_manual_client": needs_manual,
+        "message": (
+            "Ready — users can connect with one click."
+            if not needs_manual
+            else "Endpoints discovered. This server has no automatic registration — "
+                 "create an OAuth app in the provider's console and add the client ID/secret."
+        ),
+    }
 
 
 # ── Tiered governance: admin allowlist + user enablement (guide §9) ──

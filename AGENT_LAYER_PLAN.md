@@ -195,23 +195,96 @@ All choices constrained by `deployment_mode` (air-gapped enforcement).
   answered with a live `[Live 1]` citation alongside document sources, governance-enforced and
   audited, no live data persisted.
 
-**Phase 3 — Actions & approval gate**
-- Action Sub-Agent (preview -> surface), approval gate + single-use scoped short-lived token,
-  resume-on-approval; wire token -> gateway enforcement; one-action-per-approval; reasoning + source
-  display. Test approve and reject end to end.
-- **Exit:** an agent proposes an action, a human approves the specific preview, it executes once;
-  an unapproved or mismatched execute is refused.
+**Phase 3 — Actions & approval gate** ✅ DONE & verified
+- Action Sub-Agent ([action_agent](backend/agents/action_agent/)) proposes ONE gated action (SDK
+  ACTION tools only), calls `gateway.preview_action`, surfaces preview + reasoning + cited sources via
+  an `approval_required` SSE event with a `pending_id`. Approve/reject go through
+  `POST /api/agents/actions/{pending_id}/approve|reject`, which mint the single-use token and execute
+  once (or cancel). Resume uses the **gateway's Redis pending-record**, not a LangGraph checkpointer
+  (checkpointer reserved for cross-turn memory / multi-action plans — see §6).
+- Orchestrator routes `action` intent: classify -> retrieve (ground) -> propose_action -> await approval;
+  falls back to a grounded answer when no action is warranted/available.
+- **Exit met (verified with `demo-tickets create_ticket`):** propose -> reject never executes (later
+  approve refused: "action already rejected"); propose -> approve executes once (`OPS-3` created);
+  re-approve refused ("unknown or expired action") — single-use enforcement confirmed.
 
-**Phase 4 — Skill files & synchronization**
-- Versioned/reversible skill files + dependency registry + ingestion event carrying prior-version
-  diff context; Skill Sync Agent (explicit + inferred-fallback resolution, admin-gated diffs,
-  reversible writes); untrusted-content handling across all agents.
-- **Exit:** a document change yields a proposed, human-reviewed skill-file diff that, on approval,
-  updates the dependent assistant's instructions as a reversible version — never autonomously.
+**Phase 4 — Skill files & synchronization** — Sprint 7 ✅ DONE, Sprint 8 next
+- **Sprint 7 ✅ (DB source of truth):** DB models (SkillFile = human-intent `body` + corpus-fact
+  `fact_sections`; SkillFileVersion immutable+attributable; SkillDependency declared/inferred;
+  SkillChangeProposal). [skills/service.py](backend/skills/service.py) (create / versioned fact edits /
+  admin body edits / rollback / dependency declare+resolve / render) + [skills/parser.py](backend/skills/parser.py)
+  (Anthropic-format frontmatter+body+fact sections). Ingestion-complete **Celery event**
+  ([tasks/skill_sync_task.py](backend/tasks/skill_sync_task.py)) enqueued from the ingestion pipeline.
+  Verified: 4 attributed versions incl. rollback, dependency resolution, SKILL.md render.
+- **Sprint 8 ✅ DONE & verified:** Skill Sync Agent ([agents/skill_sync/](backend/agents/skill_sync/))
+  — `run_sync_for_document` (runs in the Celery worker): explicit dep resolution
+  (`skills_declaring_document`) + inferred (Gemini-embedding cosine of changed content vs each fact
+  section, threshold 0.55), model-proposed grounded diffs (changed doc treated as untrusted data) into
+  `SkillChangeProposal` (pending). Admin endpoints [api/skills.py](backend/api/skills.py): list/create/get
+  skills, rollback, declare dependency, list proposals, approve (→ new reversible version via
+  `set_fact_section`), reject (logged). Never auto-applies.
+- **Exit MET (verified):** a changed doc ("leave now 30 days") produced an explicit proposal
+  `21→30 days`; approve wrote skill v2 (attributed `skill_sync:doc:<id>`); reject left the version
+  unchanged. The self-maintaining-groundedness loop is closed.
+
+> **Backend layers complete:** DeepQuerySDK → Connector Infrastructure → **Agent Layer (Phases 1–4)**.
+> Remaining before UI: the §5b pre-UI capability gaps (#1 direct-intent ✅ done; #2 conversation
+> memory + stop/steer; #3 whole-doc + attachments).
 
 ---
 
+## 5b. Pre-UI capability gaps (agreed — do before the UI phase)
+These reshape the agent from "RAG-over-chunks" into a capable assistant; required before UI.
+1. **Direct / general-knowledge intent (no retrieval). ✅ DONE & verified.** 4th intent `direct` →
+   `direct_answer` node skips retrieval + verifier, streams the answer, emits a `grounding` event
+   (`grounded:false`) + `done.grounded=False`, no citations. Gated by `settings.agent_allow_ungrounded_answers`
+   (default True; False → direct falls through to the grounded path). Per-assistant override + explicit
+   per-query toggle still to come with the registry/UI.
+2. **Conversation memory + stop/steer. ✅ DONE & verified.** App-level (DB history → `chat_history`),
+   not the LangGraph checkpointer — its unique value (mid-flight resume) isn't needed here, and this
+   avoids restructuring graph state + a new dependency. `AgentConversation`/`AgentTurn` tables (also the
+   agent-run trace); `/api/agents/run` loads prior turns as memory, persists user turn up front +
+   assistant turn on completion; GET/DELETE `/api/agents/conversations[/{id}]`. Stop = disconnect
+   cancels the run (assistant turn unsaved, user turn persists); steer = new turn in the same
+   conversation loads history. Verified: a follow-up resolved "the same percentage" from prior turns.
+   True mid-flight interject deferred (would use checkpointer/`interrupt`).
+3. **Whole-document & user-attached context. ✅ DONE & verified (text path).** Whole-doc =
+   **reparse-on-demand** ([agents/documents.py](backend/agents/documents.py), via ingestion parsers,
+   12k-char cap); auto-expands when ≥2 retrieved chunks share a document → `[Doc N]`. User attachments:
+   `AgentAttachment` table (raw file on disk + extracted text + kind — **images stored from day 1**,
+   fed to the model once the Gemini multimodal path lands), `POST /api/agents/attachments`, `/run`
+   `attachment_ids`, persisted + returned on conversation load (`[Attachment N]`). generate_node now
+   assembles 4 source kinds. Verified: an attached `notes.txt` was cited `[Attachment 1]`; a corpus PDF
+   re-parsed to full text. Deferred: images-to-model (Gemini path), reparse caching, mid-flight interject.
+
+All §5b pre-UI gaps (#1, #2, #3) are **done**. Order completed: Phase 4 → {#1, #2, #3} → **UI next**.
+
+## 5c. Resumable agent (RESUMABLE_AGENT_SPEC_V2) — build status
+
+**Phase R1 — Checkpointer + two-node gate + resume ✅ DONE (2026-06-12).**
+`langgraph-checkpoint-redis==0.1.1` (the only langgraph-0.2.x-compatible release; forced
+`redis-py 5.2.1 → 6.4.0`, inside kombu's `<6.5` window) + Redis 8 (`redis:8-alpine`,
+bundles RedisJSON/RediSearch) with **AOF on** (`--appendonly yes --appendfsync everysec`)
+— compose + SETUP_AND_RUN.md updated; checkpoints share **db 0** (RediSearch constraint;
+distinct key prefixes from Celery — never FLUSHDB db 0). Graph compiles lazily WITH the
+checkpointer (TTL `agent_run_ttl_hours`, default 72h) and degrades to the legacy
+single-pass graph if Redis is down. Per-RUN `thread_id`; two-node gate
+(`propose_action` = prepare w/ side effects + idempotent preview keyed
+`(thread_id, step)`; `await_approval` = interrupt only); resume → `resolve_action`
+(approve→token+execute / reject) → `report_action` (grounded report streamed as the
+answer — supersedes the Q6 shim once the UI migrates). Expired pending record (10-min
+gate TTL vs multi-day pause) re-previews + re-gates, never errors.
+`POST /api/agents/threads/{thread_id}/resume` (SSE continuation; persists resolution +
+report turn); old `/actions/{id}/approve|reject` kept for legacy fallback + current UI.
+Verified: 17-check e2e (pause/resume across orchestrator instances, reject, double-resume,
+wrong-user, doc-path regression) + 6-check legacy-fallback suite, live endpoint check.
+**Next: R2 event bus + snapshot → R3 executor ownership → R4 controller loop** (spec §4).
+
 ## 6. Open / deferred items
+- ~~**LangGraph checkpointer + `interrupt`**~~ — **landed in Phase R1 (§5c)** for the action
+  gate; the multi-action/controller-loop consumers arrive with R4+.
+- **Admin-curated read-tool allowlist** (+ `agent_allow_unannotated_reads` strict toggle) — the
+  reliable production hardening over the ecosystem read-name heuristic; do it with connector-governance UI.
 - Assistant-authoring **UI** (registry CRUD surface) — foundation now, UI later.
 - A gated **code-execution/scripting** capability for the orchestrator — out of scope unless
   explicitly wanted.

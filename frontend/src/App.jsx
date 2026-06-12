@@ -4,6 +4,9 @@ import Layout from './components/Layout';
 import LandingPage from './pages/LandingPage';
 import LoginPage from './pages/LoginPage';
 import ChatPage from './pages/ChatPage';
+import AgentsPage from './pages/AgentsPage';
+import ConnectorsPage from './pages/ConnectorsPage';
+import SkillsPage from './pages/SkillsPage';
 import SearchPage from './pages/SearchPage';
 import AdminPage from './pages/AdminPage';
 import DocumentViewerPage from './pages/DocumentViewerPage';
@@ -65,6 +68,17 @@ export default function App() {
       >
         <Route path="chat" element={<ChatPage />} />
         <Route path="chat/:conversationId" element={<ChatPage />} />
+        <Route path="agents" element={<AgentsPage />} />
+        <Route path="agents/:conversationId" element={<AgentsPage />} />
+        <Route path="connectors" element={<ConnectorsPage />} />
+        <Route
+          path="skills"
+          element={
+            <ProtectedRoute roles={['admin']}>
+              <SkillsPage />
+            </ProtectedRoute>
+          }
+        />
         <Route path="search" element={<SearchPage />} />
         <Route path="documents/:id" element={<DocumentViewerPage />} />
         <Route

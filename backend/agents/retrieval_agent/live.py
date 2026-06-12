@@ -28,9 +28,9 @@ from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from agents.connector_gateway import gateway as _gateway
 from agents.models import Slot, get_model
 from agents.orchestrator.prompts import LIVE_TOOL_SELECTION_PROMPT
-from connectors.gateway import ConnectorGateway
 from connectors.governance import available_for_role, is_enabled
 from connectors.mcp_client.types import ToolKind
 from core.config import settings
@@ -39,29 +39,21 @@ from models.database import User
 
 logger = logging.getLogger(__name__)
 
-# One gateway instance for the agent layer. The circuit breaker is in-process by
-# design (handoff §5), so a dedicated instance is fine.
-_gateway = ConnectorGateway()
-
 MAX_LIVE_CALLS = 3          # ceiling on connector reads per query (bounded blast radius)
 MAX_RECORDS_PER_CALL = 5    # cap records pulled into context from any one read
 MAX_RECORD_CHARS = 4000     # cap each record's size — public servers can return huge
                             # payloads (e.g. a whole wiki page) that blow the context window
 
-# Verb fragments that mark an ecosystem (non-SDK) tool as read-like. SDK connectors
-# classify reads precisely (dq.mutates=False → RESOURCE); ecosystem servers that omit
-# MCP readOnlyHint are conservatively flagged mutates=True/UNKNOWN, so we gate auto-use
-# behind this name heuristic — a read-named UNKNOWN tool is safe to call; a mutating one
-# (e.g. create_/update_/delete_/send_) is not auto-invoked here (actions are gated, Phase 3).
-_READ_NAME_HINTS = (
-    "search", "fetch", "get", "list", "read", "query", "find", "lookup",
-    "browse", "ask", "retrieve", "view", "show", "describe",
-)
-
-
-def _looks_like_read(tool_name: str) -> bool:
-    name = (tool_name or "").lower()
-    return any(hint in name for hint in _READ_NAME_HINTS)
+# Tool routing is by the connector's DECLARED classification — no name guessing. Once
+# an admin approves a connector it is trusted (the audit trail records who approved
+# what, when). From there, a tool's `kind` decides routing:
+#   RESOURCE — declared read-only (SDK dq.mutates=False, or MCP readOnlyHint) → free read.
+#   UNKNOWN  — un-annotated ecosystem tool → available as a free read AND proposable as a
+#              gated action; the user's intent routes it (a read query reads it; an action
+#              query proposes it for approval). Nothing is dropped or name-guessed.
+#   ACTION   — SDK-declared mutation → gated (human approval, two-phase preview/execute).
+# `agent_live_strict_read_filter` tightens this to SDK/annotated connectors only: UNKNOWN
+# tools are then excluded entirely (no free read, no auto-proposal).
 
 # In-process discovery cache: connector_id -> (expires_at, read-tool list). Avoids a
 # subprocess/network round-trip per query (TTL: settings.agent_discovery_cache_ttl_seconds).
@@ -92,10 +84,15 @@ def _enabled_connector_catalog(user_id: str) -> list[dict[str, Any]]:
         db.close()
 
 
-async def _discover_read_tools(conn: dict[str, Any]) -> list[dict[str, Any]]:
-    """Discover one connector's read-only tools, cached with a TTL. Failures (server
+async def _discover_tools(conn: dict[str, Any], user_id: Optional[str] = None) -> list[dict[str, Any]]:
+    """Discover + cache ALL of a connector's classified tools (TTL). Read vs action
+    filtering happens downstream so a single discovery serves both. Failures (server
     down, etc.) are swallowed and not cached — a missing connector must never break
-    the answer (guide §14), and should be retried next query."""
+    the answer (guide §14), and should be retried next query.
+
+    ``user_id`` is required for OAuth/authenticated connectors: the gateway injects the
+    user's credential to even open the MCP connection (tool LISTS are user-independent,
+    so caching by connector_id stays valid)."""
     cid = conn["connector_id"]
     ttl = settings.agent_discovery_cache_ttl_seconds
     if ttl > 0:
@@ -104,45 +101,72 @@ async def _discover_read_tools(conn: dict[str, Any]) -> list[dict[str, Any]]:
             return hit[1]
 
     try:
-        _ref, disc = await _gateway.discover(connector_id=cid)
+        _ref, disc = await _gateway.discover(connector_id=cid, user_id=user_id)
     except Exception as exc:
         logger.warning("Discovery failed for connector '%s': %s", conn["connector"], exc)
         return []
-    tools = []
-    for t in disc.tools:
-        # Never auto-invoke SDK-classified mutations or control tools — actions are
-        # gated (Phase 3), never used for free retrieval.
-        if t.kind in (ToolKind.ACTION, ToolKind.CONTROL):
-            continue
-        if t.kind == ToolKind.RESOURCE:
-            pass  # known read-only (SDK dq.mutates=False, or MCP readOnlyHint)
-        elif t.kind == ToolKind.UNKNOWN:
-            # Ecosystem tool with unknown mutation status — only auto-read it if its
-            # name reads like a read (search/fetch/get/...); the `mutates` flag here is
-            # a conservative default, not authoritative.
-            if not _looks_like_read(t.name):
-                continue
-        else:
-            continue
-        tools.append({
-            "connector_id": cid,
-            "connector": conn["connector"],
-            "tool": t.name,
-            "description": t.description,
-            "input_schema": t.input_schema,
-        })
+    tools = [{
+        "connector_id": cid,
+        "connector": conn["connector"],
+        "tool": t.name,
+        "description": t.description,
+        "input_schema": t.input_schema,
+        "kind": t.kind,
+        "mutates": t.mutates,
+    } for t in disc.tools]
 
     if ttl > 0:
         _DISCOVERY_CACHE[cid] = (time.time() + ttl, tools)
     return tools
 
 
-async def _build_catalog(user_id: str) -> list[dict[str, Any]]:
+def _is_auto_read(t: dict[str, Any]) -> bool:
+    """Whether a tool may be AUTO-invoked for free retrieval (no approval).
+
+    By the connector's declared classification — no name heuristic. RESOURCE (declared
+    read-only) is always a free read. UNKNOWN (un-annotated ecosystem) tools are free
+    reads too — the connector was admin-approved, and the user's intent routes mutating
+    use to the action gate. ACTION/CONTROL are never auto-read. Strict deployments
+    (``agent_live_strict_read_filter``) restrict free reads to RESOURCE only."""
+    kind = t["kind"]
+    if kind == ToolKind.RESOURCE:
+        return True
+    if kind == ToolKind.UNKNOWN:
+        return not settings.agent_live_strict_read_filter
+    return False
+
+
+def _is_gated_action(t: dict[str, Any]) -> bool:
+    """Tools the Action Sub-Agent may propose for human approval: SDK-classified ACTION
+    tools (two-phase dry-run preview/execute), and UNKNOWN ecosystem tools (no dry-run —
+    the gate synthesizes the preview). So an action-intent query can still mutate via an
+    ecosystem connector, with approval. Strict mode excludes UNKNOWN entirely (SDK only)."""
+    kind = t["kind"]
+    if kind == ToolKind.ACTION:
+        return True
+    if kind == ToolKind.UNKNOWN:
+        return not settings.agent_live_strict_read_filter
+    return False
+
+
+async def _all_tools(user_id: str) -> list[dict[str, Any]]:
     connectors = await asyncio.to_thread(_enabled_connector_catalog, user_id)
     if not connectors:
         return []
-    tool_lists = await asyncio.gather(*[_discover_read_tools(c) for c in connectors])
-    return [tool for sub in tool_lists for tool in sub]
+    # Pass user_id so OAuth/authenticated connectors can be discovered (the gateway
+    # injects the user's credential to open the connection).
+    lists = await asyncio.gather(*[_discover_tools(c, user_id) for c in connectors])
+    return [tool for sub in lists for tool in sub]
+
+
+async def _build_catalog(user_id: str) -> list[dict[str, Any]]:
+    """Read-tool catalog for free retrieval (auto-invokable reads)."""
+    return [t for t in await _all_tools(user_id) if _is_auto_read(t)]
+
+
+async def build_action_catalog(user_id: str) -> list[dict[str, Any]]:
+    """Gated-action catalog for the Action Sub-Agent (SDK ACTION tools)."""
+    return [t for t in await _all_tools(user_id) if _is_gated_action(t)]
 
 
 def _parse_json_object(text: str) -> Optional[dict]:
@@ -251,13 +275,30 @@ async def gather_live(
     if not user_id:
         return {"records": [], "citations": [], "tool_activity": []}
 
-    catalog = await _build_catalog(user_id)
+    # Resolve the enabled connectors + their tools inline so we can report *why* the
+    # live path found nothing — the live attempt is otherwise invisible, which makes a
+    # live-intent query look like it silently ignored the connectors.
+    connectors = await asyncio.to_thread(_enabled_connector_catalog, user_id)
+    if not connectors:
+        return {"records": [], "citations": [], "tool_activity": [
+            {"tool": "live_search", "detail": "no connectors enabled for you", "status": "ok"}]}
+
+    lists = await asyncio.gather(*[_discover_tools(c) for c in connectors])
+    all_tools = [t for sub in lists for t in sub]
+    catalog = [t for t in all_tools if _is_auto_read(t)]
     if not catalog:
-        return {"records": [], "citations": [], "tool_activity": []}
+        detail = (
+            f"{len(connectors)} connector(s) enabled but no tools discovered (server unreachable?)"
+            if not all_tools
+            else f"{len(all_tools)} tool(s) discovered but none are usable as a free read"
+        )
+        return {"records": [], "citations": [], "tool_activity": [
+            {"tool": "live_search", "detail": detail, "status": "ok"}]}
 
     calls = await _select_calls(query, catalog)
     if not calls:
-        return {"records": [], "citations": [], "tool_activity": []}
+        return {"records": [], "citations": [], "tool_activity": [
+            {"tool": "live_search", "detail": "no live tool matched the request", "status": "ok"}]}
 
     results = await asyncio.gather(
         *[_execute_call(c, user_id, conversation_id) for c in calls]

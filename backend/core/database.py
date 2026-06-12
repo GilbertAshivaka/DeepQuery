@@ -67,6 +67,26 @@ def init_db():
         ConnectorCredential,
         ConnectorApproval,
         UserConnectorEnablement,
+        SkillFile,
+        SkillFileVersion,
+        SkillDependency,
+        SkillChangeProposal,
+        AgentConversation,
+        AgentTurn,
+        AgentAttachment,
     )
 
     Base.metadata.create_all(bind=engine)
+
+    # Lightweight additive migrations (SQLite create_all won't add new columns to
+    # existing tables). Idempotent — only adds a column when it's missing.
+    if settings.database_url.startswith("sqlite"):
+        _add_column_if_missing("agent_turns", "agent_trace", "TEXT")
+
+
+def _add_column_if_missing(table: str, column: str, ddl_type: str):
+    """Add `column` to `table` if it isn't already present (SQLite ALTER ADD COLUMN)."""
+    with engine.begin() as conn:
+        existing = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")

@@ -13,6 +13,7 @@ from api.admin import router as admin_router
 from api.graph import router as graph_router
 from api.connectors import router as connectors_router
 from api.agents import router as agents_router
+from api.skills import router as skills_router
 
 api_router = APIRouter()
 
@@ -23,3 +24,4 @@ api_router.include_router(admin_router, prefix="/api/admin", tags=["Admin"])
 api_router.include_router(graph_router, prefix="/api/graph", tags=["Knowledge Graph"])
 api_router.include_router(connectors_router, prefix="/api/connectors", tags=["Connectors"])
 api_router.include_router(agents_router, prefix="/api/agents", tags=["Agents"])
+api_router.include_router(skills_router, prefix="/api/skills", tags=["Skills"])

@@ -64,6 +64,21 @@ class Settings(BaseSettings):
     # a subprocess/network round-trip per query. 0 disables the cache.
     agent_discovery_cache_ttl_seconds: int = 600
 
+    # Whether the agent may answer a "direct" (general-knowledge) question from the
+    # model itself, without grounding in the corpus/live sources. Such answers are
+    # clearly labelled as ungrounded. High-stakes deployments (legal, healthcare) can
+    # set this False to force grounded-only answers. (Per-assistant override later.)
+    agent_allow_ungrounded_answers: bool = True
+
+    # Strict read filtering for the live path. By default, UNKNOWN (un-annotated
+    # ecosystem) tools from an admin-approved connector are usable — as free reads, and
+    # proposable as gated actions (the user's intent routes mutating use through the
+    # approval gate; admin approval + the audit trail are the trust boundary). No name
+    # heuristic. Set True for SDK-only deployments: then ONLY tools that DECLARE their
+    # read/mutate status are used — SDK/annotated reads (RESOURCE) are free reads, and
+    # every UNKNOWN tool is excluded entirely (not read, not proposed).
+    agent_live_strict_read_filter: bool = False
+
     # ── ChromaDB ─────────────────────────────────────────────
     chroma_persist_directory: str = "./chroma_data"
     chroma_host: str = "localhost"
@@ -83,6 +98,20 @@ class Settings(BaseSettings):
     # ── Celery / Redis ───────────────────────────────────────
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_result_backend: str = "redis://localhost:6379/1"
+
+    # ── Agent run durability (RESUMABLE_AGENT_SPEC_V2 §2.1) ──
+    # Redis URL for the LangGraph checkpointer (paused/resumable agent runs).
+    # MUST be db 0: the checkpointer's RediSearch indexes only work there. Coexists
+    # with the Celery broker via distinct key prefixes (checkpoint:* vs celery/_kombu*)
+    # — never FLUSHDB this db (see SETUP_AND_RUN.md). Redis must run with AOF on.
+    agent_redis_url: str = "redis://localhost:6379/0"
+    # Durable runs (checkpointer + interrupt/resume action gate). When False — or when
+    # Redis is unreachable at startup — the orchestrator compiles without a
+    # checkpointer and behaves exactly as before (single-pass, no resume).
+    agent_durable_runs: bool = True
+    # How long a paused run remains resumable. The TTL sweeper expires older
+    # checkpoints (a paused approval older than this requires a fresh run).
+    agent_run_ttl_hours: int = 72
 
     # ── Connector Infrastructure ─────────────────────────────
     # Fernet key for encrypting per-user connector credentials at rest. Generate

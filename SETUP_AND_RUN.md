@@ -83,13 +83,20 @@ npm install
 
 Open a terminal and run these commands to start the infrastructure services:
 
-### Redis (message broker for Celery)
+### Redis (Celery broker + agent run state)
+
+Redis 8 is required (bundles the RedisJSON + RediSearch modules used by the agent
+checkpointer). AOF persistence (`--appendonly yes`) is **mandatory**: paused agent runs
+(awaiting approval/answers) live in Redis checkpoints, so Redis must survive restarts
+without losing them. The named volume keeps the AOF across container recreations.
 
 ```bash
 docker run -d \
   --name deepquery-redis \
   -p 6379:6379 \
-  redis:7-alpine
+  -v deepquery_redis_data:/data \
+  redis:8-alpine \
+  redis-server --appendonly yes --appendfsync everysec
 ```
 
 ### ChromaDB (vector database)
@@ -204,10 +211,15 @@ source venv/Scripts/activate
 python requeue_pending.py
 ```
 
-### Flush Redis (clear all queued tasks)
+### Flush Celery queues (clear queued tasks)
+
+> ⚠️ Do **not** use `FLUSHALL` or `FLUSHDB` on db 0 anymore — db 0 also holds durable
+> agent run state (checkpoints for paused/resumable runs; RediSearch requires db 0).
+> Delete only Celery's queue key, and flush db 1 (results only) if needed:
 
 ```bash
-docker exec deepquery-redis redis-cli FLUSHALL
+docker exec deepquery-redis redis-cli -n 0 DEL celery
+docker exec deepquery-redis redis-cli -n 1 FLUSHDB
 ```
 
 ### Restart a Docker container
@@ -234,7 +246,8 @@ docker start deepquery-redis deepquery-chroma deepquery-neo4j
 
 ```bash
 docker rm -f deepquery-redis
-docker run -d --name deepquery-redis -p 6379:6379 redis:7-alpine
+docker run -d --name deepquery-redis -p 6379:6379 -v deepquery_redis_data:/data \
+  redis:8-alpine redis-server --appendonly yes --appendfsync everysec
 ```
 
 ### Check Celery worker registered tasks
@@ -353,7 +366,7 @@ The Celery worker can't find sibling packages. This is already handled in the co
 ### Documents stuck at "PENDING"
 - Check that the Celery worker is running and shows the task `tasks.run_ingestion_pipeline`
 - Check Redis is running: `docker ps | grep redis`
-- Flush stale tasks: `docker exec deepquery-redis redis-cli FLUSHALL`
+- Flush stale tasks: `docker exec deepquery-redis redis-cli -n 0 DEL celery` (never `FLUSHALL`/`FLUSHDB 0` — they would wipe agent run state)
 - Re-queue: `python requeue_pending.py`
 
 ### "document closed" error on PDFs

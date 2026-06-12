@@ -1,0 +1,131 @@
+import api from './api';
+
+/**
+ * Run the Orchestrator agent via SSE (POST /api/agents/run).
+ *
+ * EventSource can't set the Authorization header, so we use fetch + a stream
+ * reader (the same pattern as queryService.streamChat). Each SSE frame is
+ * `data: {json}\n\n`; we parse and hand the typed event to onEvent.
+ *
+ * Returns an AbortController — aborting it stops the run (handoff §4: the
+ * backend cancels, the user turn is kept, the assistant turn is not saved).
+ */
+export function runAgent({ query, conversationId, attachmentIds }, onEvent, onDone, onError) {
+  const controller = new AbortController();
+
+  const body = { query };
+  if (conversationId) body.conversation_id = conversationId;
+  if (attachmentIds?.length) body.attachment_ids = attachmentIds;
+
+  const token = localStorage.getItem('access_token');
+
+  fetch('/api/agents/run', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+    },
+    body: JSON.stringify(body),
+    signal: controller.signal,
+  })
+    .then(async (response) => {
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const payload = line.slice(6);
+          if (payload === '[DONE]') {
+            onDone?.();
+            return;
+          }
+          try {
+            onEvent?.(JSON.parse(payload));
+          } catch {
+            // ignore malformed frames
+          }
+        }
+      }
+
+      onDone?.();
+    })
+    .catch((err) => {
+      if (err.name !== 'AbortError') onError?.(err);
+    });
+
+  return controller;
+}
+
+// ── Attachments (user-provided docs/images) ─────────────────
+export async function uploadAttachment(file, conversationId) {
+  const form = new FormData();
+  form.append('file', file);
+  if (conversationId) form.append('conversation_id', conversationId);
+  // Let the browser set the multipart boundary — don't force the content-type.
+  const { data } = await api.post('/api/agents/attachments', form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+  return data; // {id, filename, kind, chars}
+}
+
+export async function getAttachment(id) {
+  const { data } = await api.get(`/api/agents/attachments/${id}`);
+  return data; // metadata + extracted_text
+}
+
+// The raw file as a Blob (authed). Callers wrap it in an object URL for an
+// <img>/<iframe> src — those can't carry the Authorization header themselves.
+export async function getAttachmentBlob(id) {
+  const { data } = await api.get(`/api/agents/attachments/${id}/content`, {
+    responseType: 'blob',
+  });
+  return data;
+}
+
+// ── Conversation history (separate store from chat) ──────────
+export async function getConversations() {
+  const { data } = await api.get('/api/agents/conversations');
+  return data;
+}
+
+export async function getConversation(conversationId) {
+  const { data } = await api.get(`/api/agents/conversations/${conversationId}`);
+  return data;
+}
+
+export async function deleteConversation(conversationId) {
+  const { data } = await api.delete(`/api/agents/conversations/${conversationId}`);
+  return data;
+}
+
+// ── Approval-gate resume (returns JSON, not SSE) ─────────────
+export async function approveAction(pendingId) {
+  const { data } = await api.post(`/api/agents/actions/${pendingId}/approve`);
+  return data;
+}
+
+export async function rejectAction(pendingId) {
+  const { data } = await api.post(`/api/agents/actions/${pendingId}/reject`);
+  return data;
+}
+
+// ── Health (model slots, capabilities, deployment mode) ──────
+export async function getHealth() {
+  const { data } = await api.get('/api/agents/health');
+  return data;
+}

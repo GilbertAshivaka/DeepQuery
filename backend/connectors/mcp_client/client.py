@@ -258,6 +258,25 @@ class MCPConnectorClient:
                 raise MCPClientError(f"connector {self.config.name!r}: execute {capability!r} errored: {text}")
             return (executed.structuredContent or {}).get("result")
 
+    async def execute_plain(self, capability: str, arguments: dict[str, Any] | None = None) -> Any:
+        """Call a non-SDK (ecosystem) tool once and return its result. These servers
+        have no two-phase preview/execute protocol — there's no dry-run, so calling IS
+        executing. The Gateway invokes this only after a human approved the previewed
+        call, so the single call here is the approved action."""
+        async with self._session() as (session, _init):
+            try:
+                async with asyncio.timeout(self.timeout_s):
+                    result = await session.call_tool(capability, arguments or {})
+            except Exception as exc:
+                raise MCPClientError(f"connector {self.config.name!r}: action {capability!r} failed: {exc}") from exc
+        if result.isError:
+            text = next((b.text for b in result.content if getattr(b, "text", None)), "")
+            raise MCPClientError(f"connector {self.config.name!r}: action {capability!r} errored: {text}")
+        if result.structuredContent:
+            return result.structuredContent
+        texts = [b.text for b in result.content if getattr(b, "text", None)]
+        return "\n".join(texts) if texts else None
+
     # -- helpers ----------------------------------------------------------
     def _classify(self, tool: types.Tool) -> DiscoveredTool:
         meta = tool.meta or {}

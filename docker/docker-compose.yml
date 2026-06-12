@@ -56,10 +56,15 @@ services:
     networks:
       - deepquery-net
 
-  # ── Redis (Celery broker) ────────────────────────────────────
+  # ── Redis (Celery broker + agent run checkpoints/streams) ───
+  # Redis 8: bundles RedisJSON + RediSearch (required by langgraph-checkpoint-redis).
+  # AOF (appendonly) is MANDATORY — agent checkpoints, pending approvals, and event
+  # streams are sources of truth for paused runs (RESUMABLE_AGENT_SPEC_V2 §6);
+  # everysec fsync bounds loss to ≤1s on power failure.
   redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     container_name: deepquery-redis
+    command: redis-server --appendonly yes --appendfsync everysec
     ports:
       - "6379:6379"
     volumes:

@@ -22,7 +22,7 @@ langchain>=0.3.14,<0.4
 langchain-core>=0.3.33,<0.4
 langchain-community>=0.3.14,<0.4
 langchain-google-genai>=2.0.8,<3.0
-langchain-groq>=0.2.4,<0.3
+langchain-groq>=0.3,<0.4
 langchain-text-splitters>=0.3.4,<0.4
 
 # ── Agent Layer (orchestration) ──
@@ -30,9 +30,18 @@ langchain-text-splitters>=0.3.4,<0.4
 # the approval-gate interrupt/resume. Sits on top of langchain-core.
 langgraph>=0.2,<0.3
 
+# Durable run state (RESUMABLE_AGENT_SPEC_V2 §2.1). ⚠️ Version triangle — do not bump
+# independently: 0.1.1 is the ONLY release compatible with langgraph-checkpoint 2.x
+# (0.2.0+ requires langgraph-checkpoint>=3 → langgraph 0.3+). It needs redis-py
+# >=6.2,<7 while kombu (celery transport) caps at <6.5 — hence the redis pin below.
+# Server side requires RedisJSON + RediSearch → Redis 8+ (docker/docker-compose.yml).
+langgraph-checkpoint-redis==0.1.1
+
 # ── Embedding & LLM APIs ──
 google-generativeai==0.8.4
-groq==0.13.1
+# groq >= 0.30 needed for gpt-oss reasoning (reasoning_format="parsed" → separate
+# streamed reasoning_content channel for the agent thinking panel).
+groq>=0.30,<1
 
 # ── Vector Database ──
 chromadb>=0.6.0
@@ -60,7 +69,9 @@ torch>=2.0.0
 
 # ── Async Task Queue ──
 celery[redis]==5.4.0
-redis==5.2.1
+# redis-py 6.2–6.4 is the window satisfying BOTH kombu (<6.5) and
+# langgraph-checkpoint-redis 0.1.1 (>=6.2,<7).
+redis>=6.2,<6.5
 
 # ── Utilities ──
 python-dotenv==1.0.1

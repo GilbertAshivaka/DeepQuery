@@ -12,6 +12,7 @@ audit writes) is offloaded to threads so it never blocks the event loop.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any, Optional
 
@@ -28,6 +29,14 @@ from connectors.mcp_client.client import MCPConnectorClient, MCPClientError
 from connectors.mcp_client.transports import STDIO, TransportConfig
 from connectors.mcp_client.types import Discovery
 from core.database import SessionLocal
+
+
+def _synthesize_preview(connector_name: str, capability: str, arguments: dict[str, Any]) -> str:
+    """Build a human-readable preview for a non-SDK action without calling the tool
+    (no dry-run exists for ecosystem servers — calling would execute it). The human
+    approves this exact call, which then runs once via ``execute_plain``."""
+    args = json.dumps(arguments, indent=2, default=str) if arguments else "{}"
+    return f"Run {connector_name}.{capability} with arguments:\n{args}"
 
 
 class GatewayError(Exception):
@@ -339,24 +348,47 @@ class ConnectorGateway:
         name: Optional[str] = None,
         user_id: Optional[str] = None,
         enforce_governance: bool = True,
+        gated_mode: str = "sdk",
+        idempotency_key: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Preview an action (no execution) and open a pending-approval record."""
+        """Preview an action (no execution) and open a pending-approval record.
+
+        ``gated_mode="sdk"`` — the connector implements the SDK two-phase protocol, so
+        we call its preview to obtain a real dry-run preview. ``gated_mode="plain"`` —
+        an ecosystem tool with no dry-run; we SYNTHESIZE the preview from the call and
+        never touch the tool here (calling it would execute it). It runs once on
+        approval via ``execute_plain``."""
         ref = await self._resolve(connector_id=connector_id, name=name)
         if enforce_governance and user_id is not None:
             await asyncio.to_thread(self._check_governance, ref, user_id)
         self._assert_deployment(ref)
         self._breaker_check(ref)
-        client = await self._make_client(ref, user_id)
-        try:
-            preview = await client.preview_action(capability, arguments or {})
-        except MCPClientError as exc:
-            circuit_breaker.record_failure(ref.name, str(exc))
-            await asyncio.to_thread(self._audit_action, ref, capability, "preview", "error", user_id, None, str(exc))
-            raise GatewayError(f"the '{ref.name}' connector is unavailable: {exc}") from exc
-        circuit_breaker.record_success(ref.name)
+        # Idempotent preview (RESUMABLE_AGENT_SPEC_V2 §2.3): a durable run keys its
+        # preview on (thread_id, step) so a replayed/re-run prepare step returns the
+        # existing pending record instead of minting a duplicate.
+        if idempotency_key:
+            existing = await asyncio.to_thread(
+                action_gate.find_by_idempotency_key, idempotency_key,
+                args_match=arguments,
+            )
+            if existing is not None:
+                return {"pending_id": existing["pending_id"], "connector": ref.name,
+                        "capability": capability, "preview": existing["preview"]}
+        if gated_mode == "plain":
+            preview = _synthesize_preview(ref.name, capability, arguments or {})
+        else:
+            client = await self._make_client(ref, user_id)
+            try:
+                preview = await client.preview_action(capability, arguments or {})
+            except MCPClientError as exc:
+                circuit_breaker.record_failure(ref.name, str(exc))
+                await asyncio.to_thread(self._audit_action, ref, capability, "preview", "error", user_id, None, str(exc))
+                raise GatewayError(f"the '{ref.name}' connector is unavailable: {exc}") from exc
+            circuit_breaker.record_success(ref.name)
         pending_id = await asyncio.to_thread(
             action_gate.request, connector_id=ref.id, connector_name=ref.name,
-            capability=capability, arguments=arguments, user_id=user_id, preview=preview,
+            capability=capability, arguments=arguments, user_id=user_id, preview=preview, mode=gated_mode,
+            idempotency_key=idempotency_key,
         )
         await asyncio.to_thread(self._audit_action, ref, capability, "preview", "success", user_id, None, None)
         return {"pending_id": pending_id, "connector": ref.name, "capability": capability, "preview": preview}
@@ -390,7 +422,11 @@ class ConnectorGateway:
         self._breaker_check(ref)
         client = await self._make_client(ref, rec.get("user_id") or user_id)
         try:
-            result = await client.execute_gated_action(rec["capability"], rec["arguments"])
+            if rec.get("mode") == "plain":
+                # Non-SDK tool: a single approved call (no two-phase protocol exists).
+                result = await client.execute_plain(rec["capability"], rec["arguments"])
+            else:
+                result = await client.execute_gated_action(rec["capability"], rec["arguments"])
         except MCPClientError as exc:
             circuit_breaker.record_failure(ref.name, str(exc))
             await asyncio.to_thread(

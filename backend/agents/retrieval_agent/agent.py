@@ -23,6 +23,20 @@ from agents.registry import Capability, SubAgentSpec, register
 logger = logging.getLogger(__name__)
 
 
+def _extract_whole_doc(document_id: str) -> tuple[str, str]:
+    """Re-parse a corpus document's full text (sync; runs in an executor)."""
+    from core.database import SessionLocal
+    from agents.documents import extract_document_text
+    db = SessionLocal()
+    try:
+        return extract_document_text(db, document_id)
+    except Exception as exc:
+        logger.warning("Whole-doc extraction failed for %s: %s", document_id, exc)
+        return ("", "")
+    finally:
+        db.close()
+
+
 class RetrievalAgent:
     """Gathers grounded context (document + live). Stateless; safe as a singleton."""
 
@@ -38,7 +52,10 @@ class RetrievalAgent:
         image_base64: Optional[str] = None,
         user_id: str = "",
         conversation_id: Optional[str] = None,
+        want_documents: bool = True,
         want_live: bool = False,
+        want_whole_doc: bool = False,
+        attachments: Optional[list[dict]] = None,
     ) -> dict[str, Any]:
         """Gather grounded context for a query.
 
@@ -53,6 +70,8 @@ class RetrievalAgent:
         from retrieval.pipeline import gather_context
 
         async def _doc():
+            if not want_documents:
+                return None  # intent doesn't call for the corpus — skip the search entirely
             return await gather_context(
                 query=query,
                 allowed_collections=allowed_collections,
@@ -77,22 +96,24 @@ class RetrievalAgent:
         chunks_retrieved = 0
         error = None
 
-        # ── Document path ──
-        if ctx.get("error"):
-            logger.warning("Document retrieval failed: %s", ctx.get("error"))
-            error = ctx["error"]
-            tool_activity.append({"tool": "document_search", "detail": "retrieval unavailable", "status": "error"})
-        else:
-            context_chunks = ctx.get("formatted_chunks", [])
-            graph_context = ctx.get("graph_context", "")
-            chunks_retrieved = ctx.get("chunks_retrieved", 0)
-            for c in ctx.get("citations", []):
-                citations.append({**c, "source_type": "document"})
-            tool_activity.append({
-                "tool": "document_search",
-                "detail": f"{chunks_retrieved} relevant passage(s)",
-                "status": "ok",
-            })
+        # ── Document path ── (only when the intent calls for the corpus; ctx is None
+        # when the search was skipped, so no misleading "0 passages" activity appears)
+        if ctx is not None:
+            if ctx.get("error"):
+                logger.warning("Document retrieval failed: %s", ctx.get("error"))
+                error = ctx["error"]
+                tool_activity.append({"tool": "document_search", "detail": "retrieval unavailable", "status": "error"})
+            else:
+                context_chunks = ctx.get("formatted_chunks", [])
+                graph_context = ctx.get("graph_context", "")
+                chunks_retrieved = ctx.get("chunks_retrieved", 0)
+                for c in ctx.get("citations", []):
+                    citations.append({**c, "source_type": "document"})
+                tool_activity.append({
+                    "tool": "document_search",
+                    "detail": f"{chunks_retrieved} relevant passage(s)",
+                    "status": "ok",
+                })
 
         # ── Live path ── (records and citations are parallel-indexed)
         live_records: list[dict] = []
@@ -103,9 +124,48 @@ class RetrievalAgent:
             citations.append({**cit, "source_type": "live", "live_number": i})
         tool_activity.extend(live.get("tool_activity", []))
 
+        # ── Whole-document expansion ── when the retrieved chunks concentrate on a
+        # single corpus document, pull its full extracted text (re-parsed on demand)
+        # so the model has complete context, not just fragments.
+        whole_documents: list[dict] = []
+        if want_whole_doc and context_chunks:
+            from collections import Counter
+            ids = [c.get("document_id") for c in context_chunks if c.get("document_id")]
+            if ids:
+                top_id, count = Counter(ids).most_common(1)[0]
+                # Expand when at least 2 retrieved chunks come from the same document
+                # (signals the query is centred on it). Token-capped, so cost is bounded.
+                if top_id and count >= 2:
+                    loop = asyncio.get_event_loop()
+                    title, text = await loop.run_in_executor(None, _extract_whole_doc, top_id)
+                    if text:
+                        n = len([w for w in whole_documents]) + 1
+                        whole_documents.append({"document_id": top_id, "title": title, "text": text})
+                        citations.append({
+                            "source_type": "document_full", "doc_number": n,
+                            "document_name": title, "document_id": top_id,
+                        })
+                        tool_activity.append({
+                            "tool": "document_expand", "detail": f"loaded full text of '{title}'", "status": "ok",
+                        })
+
+        # ── User-attached documents ── (this-turn context, parsed text)
+        attachment_ctx: list[dict] = []
+        for i, att in enumerate(attachments or [], 1):
+            text = (att.get("text") or "").strip()
+            if not text:
+                continue  # images carry no text for the (text-only) generator yet
+            attachment_ctx.append({"attachment_number": i, "filename": att.get("filename", f"attachment-{i}"), "text": text})
+            citations.append({
+                "source_type": "attachment", "attachment_number": i,
+                "filename": att.get("filename", f"attachment-{i}"),
+            })
+
         result: dict[str, Any] = {
             "context_chunks": context_chunks,
             "live_records": live_records,
+            "whole_documents": whole_documents,
+            "attachments": attachment_ctx,
             "citations": citations,
             "graph_context": graph_context,
             "chunks_retrieved": chunks_retrieved,

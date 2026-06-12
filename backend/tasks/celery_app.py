@@ -38,8 +38,9 @@ celery_app.conf.update(
 celery_app.autodiscover_tasks(["tasks"])
 
 # Explicit imports to ensure task registration
-import tasks.ingestion_task  # noqa: F401, E402
-import tasks.umap_task       # noqa: F401, E402
+import tasks.ingestion_task   # noqa: F401, E402
+import tasks.umap_task        # noqa: F401, E402
+import tasks.skill_sync_task  # noqa: F401, E402
 
 # ── Beat schedule (periodic tasks) ──────────────────────────
 from celery.schedules import crontab

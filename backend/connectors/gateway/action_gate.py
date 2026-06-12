@@ -17,6 +17,7 @@ from typing import Any, Optional
 from core.redis_client import redis_client
 
 _PREFIX = "dq:conn:action:"
+_IDEM_PREFIX = "dq:conn:action:idem:"
 _TTL_S = 600  # 10 minutes to drive preview -> approve -> execute
 
 _UNAVAILABLE = "the approval subsystem is temporarily unavailable; please try again"
@@ -48,6 +49,8 @@ class ActionGate:
         arguments: dict[str, Any] | None,
         user_id: Optional[str],
         preview: str,
+        mode: str = "sdk",
+        idempotency_key: Optional[str] = None,
     ) -> str:
         pending_id = secrets.token_urlsafe(18)
         stored = redis_client.set_json(
@@ -60,6 +63,9 @@ class ActionGate:
                 "args_hash": _args_hash(arguments),
                 "user_id": user_id,
                 "preview": preview,
+                # "sdk" = SDK two-phase preview/execute; "plain" = a single call on a
+                # non-SDK (ecosystem) tool, executed once on approval.
+                "mode": mode,
                 "status": "previewed",
                 "approver_id": None,
                 "approval_token": None,
@@ -70,7 +76,27 @@ class ActionGate:
         # now (clearly) rather than failing confusingly at approve/execute time.
         if not stored:
             raise ActionGateError(_UNAVAILABLE)
+        if idempotency_key:
+            redis_client.set_json(
+                _IDEM_PREFIX + idempotency_key, {"pending_id": pending_id}, ttl_seconds=_TTL_S
+            )
         return pending_id
+
+    def find_by_idempotency_key(
+        self, idempotency_key: str, *, args_match: dict[str, Any] | None = None
+    ) -> Optional[dict[str, Any]]:
+        """The still-pending record previously minted under this key, or None (also
+        None if it was consumed/expired, or if the arguments differ — a changed
+        action is a NEW action and must get a fresh preview)."""
+        ref = redis_client.get_json(_IDEM_PREFIX + idempotency_key)
+        if not ref:
+            return None
+        rec = self.get(ref.get("pending_id", ""))
+        if rec is None or rec.get("status") != "previewed":
+            return None
+        if args_match is not None and rec.get("args_hash") != _args_hash(args_match):
+            return None
+        return {**rec, "pending_id": ref["pending_id"]}
 
     def get(self, pending_id: str) -> Optional[dict[str, Any]]:
         return redis_client.get_json(_PREFIX + pending_id)

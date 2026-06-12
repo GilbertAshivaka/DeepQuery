@@ -45,6 +45,15 @@ def run_ingestion_pipeline(self, document_id: str, job_id: str) -> dict:
         result = pipeline.run(document_id=document_id, job_id=job_id)
 
         logger.info(f"Ingestion task complete for document={document_id}: {result}")
+
+        # Emit the 'document fully ingested' event so the Skill Sync Agent can review
+        # dependent skill files (guide §11). Best-effort — must not affect ingestion.
+        try:
+            from tasks.skill_sync_task import skill_sync_on_ingest
+            skill_sync_on_ingest.delay(document_id, job_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Failed to enqueue skill-sync event for {document_id}: {e}")
+
         return result
 
     except Exception as exc:

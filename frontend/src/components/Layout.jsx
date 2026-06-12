@@ -5,6 +5,9 @@ import { useAuthStore } from '../store/authStore';
 import { useChatStore } from '../store/chatStore';
 import {
   MessageSquare,
+  Bot,
+  Plug,
+  ScrollText,
   Search,
   Shield,
   LogOut,
@@ -21,6 +24,8 @@ import {
 
 const navItems = [
   { to: '/chat', icon: MessageSquare, label: 'Chat' },
+  { to: '/agents', icon: Bot, label: 'Agents' },
+  { to: '/connectors', icon: Plug, label: 'Connectors' },
   { to: '/search', icon: Search, label: 'Search' },
 ];
 
@@ -30,6 +35,7 @@ const graphNavItems = [
 ];
 
 const adminNavItems = [
+  { to: '/skills', icon: ScrollText, label: 'Skills' },
   { to: '/admin', icon: Shield, label: 'Admin' },
 ];
 
