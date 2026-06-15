@@ -154,11 +154,32 @@ class AgentState(TypedDict, total=False):
     tool_activity: list[dict]
     retrieval_error: Optional[str]
     # Action (Phase 3) + durable gate (RESUMABLE_AGENT_SPEC_V2 §2.3)
-    thread_id: str               # per-RUN checkpoint thread (durable mode only)
+    thread_id: str               # per-RUN identity (checkpoint + event-stream key)
+    durable: bool                # checkpointer active → gate pauses, idempotency keyed
     proposed_action: dict
+    proposed_batch: list[dict]   # multi-action plan awaiting batch approval (R6)
+    batch_decisions: dict        # {pending_id: "approve"|"reject"} from the batch resume
+    batch_results: list[dict]    # per-action outcomes of resolve_batch
     approval_decision: str       # "approve" | "reject" (from the resume payload)
     approver_id: str
     action_result: dict          # outcome of resolve_action (executed/rejected/failed)
+    # Controller loop (RESUMABLE_AGENT_SPEC_V2 §2.2, phase R4)
+    findings: list[str]          # distilled evidence summaries accumulated across reads
+    decision: dict               # the controller's current structured decision
+    loop_count: int              # controller iterations (fuse against runaway)
+    answered: bool               # an answer segment has been produced
+    # Context discipline + sprawl control (spec §2.7–2.8, R5)
+    artifact_refs: list[str]     # refs to raw read payloads offloaded to the artifact store
+    read_signatures: list[str]   # source-signatures of executed reads (duplicate detection)
+    no_progress_count: int       # consecutive reads that added no new evidence (stall)
+    stall_replans: int           # forced re-plans so far (escalates to wrap-up)
+    # Skills consumption (spec §2.10, R8)
+    skill_names: list[str]       # explicitly-selected skills to load at hydration (run-level)
+    skill_index: list[dict]      # {name,description,kind} for active skills (controller plans with)
+    loaded_skills: list[dict]    # {name,version,body,metadata} — pinned instruction channel
+    has_documents: bool          # corpus available this run (hint to the controller)
+    has_live: bool               # live tools available this run (hint to the controller)
+    has_action: bool             # action tools available + durable (act decision enabled)
     # Output
     answer: str
     grounded: bool
@@ -475,15 +496,18 @@ async def propose_action_node(state: AgentState) -> dict:
     if not has_capability(Capability.ACTION):
         return {"proposed_action": {"proposed": False, "reason": "no_action_capability"}}
     spec = get_subagent(Capability.ACTION)
+    # Idempotency + resumable gate apply only to durable runs (a non-durable run can't
+    # pause/replay, so it keeps the legacy one-shot preview with no idem key).
     thread_id = state.get("thread_id") or ""
+    durable = bool(state.get("durable"))
     proposal = await spec.handler.propose(
         query=state["query"],
         citations=state.get("citations", []),
         user_id=state.get("user_id", ""),
         conversation_id=state.get("conversation_id"),
-        idempotency_key=f"{thread_id}:propose_action" if thread_id else None,
+        idempotency_key=f"{thread_id}:propose_action" if (thread_id and durable) else None,
     )
-    if proposal.get("proposed") and thread_id:
+    if proposal.get("proposed") and thread_id and durable:
         proposal["thread_id"] = thread_id  # lets a reloaded client resume this run
     return {"proposed_action": proposal}
 
@@ -502,6 +526,7 @@ async def await_approval_node(state: AgentState) -> dict:
         "preview": proposal.get("preview"),
         "reasoning": proposal.get("reasoning", ""),
         "summary": proposal.get("summary", ""),
+        "target": proposal.get("target", ""),
         "sources": proposal.get("sources", []),
         "regated": proposal.get("regated", False),
     })
@@ -660,42 +685,73 @@ def _build_graph(checkpointer=None):
 
 # Compiled lazily on first run: the AsyncRedisSaver must be created inside the running
 # event loop, and a Redis outage must degrade to the legacy single-pass graph instead
-# of failing startup. (_GRAPH_DURABLE tells run()/resume() which contract is live.)
+# of failing startup. (_GRAPH_DURABLE tells run()/resume() which contract is live.) The
+# fixed graph and the controller graph (R4) share ONE saver.
 _GRAPH = None
+_CONTROLLER_GRAPH = None
 _GRAPH_DURABLE = False
+_SAVER = None
+_SAVER_READY = False
 _GRAPH_LOCK: Optional[asyncio.Lock] = None
 
 
-async def _get_graph():
-    global _GRAPH, _GRAPH_DURABLE, _GRAPH_LOCK
-    if _GRAPH is not None:
-        return _GRAPH
+def _lock() -> asyncio.Lock:
+    global _GRAPH_LOCK
     if _GRAPH_LOCK is None:
         _GRAPH_LOCK = asyncio.Lock()
-    async with _GRAPH_LOCK:
-        if _GRAPH is not None:
-            return _GRAPH
-        if settings.agent_durable_runs:
-            try:
-                from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+    return _GRAPH_LOCK
 
-                saver = AsyncRedisSaver(
-                    redis_url=settings.agent_redis_url,
-                    ttl={"default_ttl": settings.agent_run_ttl_hours * 60,  # minutes
-                         "refresh_on_read": True},
-                )
-                await saver.asetup()
-                _GRAPH = _build_graph(saver)
-                _GRAPH_DURABLE = True
-                logger.info("Orchestrator compiled with Redis checkpointer (durable runs ON)")
-                return _GRAPH
-            except Exception as exc:
-                logger.warning(
-                    "Redis checkpointer unavailable (%s) — falling back to non-durable runs", exc
-                )
-        _GRAPH = _build_graph(None)
-        _GRAPH_DURABLE = False
+
+async def _ensure_saver():
+    """Create the Redis checkpointer once (inside the loop). Sets _GRAPH_DURABLE. A Redis
+    outage degrades to non-durable (saver=None) instead of failing startup."""
+    global _SAVER, _SAVER_READY, _GRAPH_DURABLE
+    if _SAVER_READY:
+        return _SAVER
+    if settings.agent_durable_runs:
+        try:
+            from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+
+            saver = AsyncRedisSaver(
+                redis_url=settings.agent_redis_url,
+                ttl={"default_ttl": settings.agent_run_ttl_hours * 60,  # minutes
+                     "refresh_on_read": True},
+            )
+            await saver.asetup()
+            _SAVER = saver
+            _GRAPH_DURABLE = True
+            logger.info("Redis checkpointer ready (durable runs ON)")
+        except Exception as exc:
+            logger.warning("Redis checkpointer unavailable (%s) — non-durable runs", exc)
+            _SAVER, _GRAPH_DURABLE = None, False
+    _SAVER_READY = True
+    return _SAVER
+
+
+async def _get_graph():
+    global _GRAPH
+    if _GRAPH is not None:
         return _GRAPH
+    async with _lock():
+        if _GRAPH is None:
+            saver = await _ensure_saver()
+            _GRAPH = _build_graph(saver)
+            logger.info("Fixed orchestrator graph compiled (durable=%s)", _GRAPH_DURABLE)
+    return _GRAPH
+
+
+async def _get_controller_graph():
+    """The R4 controller-loop graph, sharing the saver with the fixed graph."""
+    global _CONTROLLER_GRAPH
+    if _CONTROLLER_GRAPH is not None:
+        return _CONTROLLER_GRAPH
+    async with _lock():
+        if _CONTROLLER_GRAPH is None:
+            saver = await _ensure_saver()
+            from agents.orchestrator import controller
+            _CONTROLLER_GRAPH = controller.build_controller_graph(saver)
+            logger.info("Controller-loop graph compiled (durable=%s)", _GRAPH_DURABLE)
+    return _CONTROLLER_GRAPH
 
 
 # ── Event helpers ────────────────────────────────────────────
@@ -721,12 +777,33 @@ class Orchestrator:
         user_id: str = "",
         conversation_id: Optional[str] = None,
         attachments: Optional[list[dict]] = None,
+        thread_id: Optional[str] = None,
+        skill_names: Optional[list[str]] = None,
     ) -> AsyncGenerator[dict, None]:
+        # R4: route to the controller loop when enabled (same event contract, so the API/
+        # executor/bus/UI are unchanged). Off by default → the fixed pipeline below runs.
+        if settings.agent_controller_loop:
+            await _ensure_saver()
+            durable = _GRAPH_DURABLE
+            thread_id = thread_id or f"run-{uuid.uuid4().hex}"
+            cgraph = await _get_controller_graph()
+            from agents.orchestrator import controller
+            async for ev in controller.run_controller(
+                query=query, allowed_collections=allowed_collections,
+                chat_history=chat_history, user_id=user_id, conversation_id=conversation_id,
+                attachments=attachments, thread_id=thread_id, graph=cgraph, durable=durable,
+                skill_names=skill_names,
+            ):
+                yield ev
+            return
+
         graph = await _get_graph()
         durable = _GRAPH_DURABLE
-        # Per-RUN checkpoint thread (spec §2.1): every agent turn is its own thread;
+        # Per-RUN identity (spec §2.1): every agent turn is its own thread — used as the
+        # checkpoint thread (durable only) AND the event-stream key (always, R2). The API
+        # provides it so it can seed the bus / tell the client where to subscribe;
         # conversation memory stays in the DB and is hydrated into the initial state.
-        thread_id = f"run-{uuid.uuid4().hex}" if durable else ""
+        thread_id = thread_id or f"run-{uuid.uuid4().hex}"
         config = {"configurable": {"thread_id": thread_id}} if durable else None
 
         state: AgentState = {
@@ -737,6 +814,7 @@ class Orchestrator:
             "conversation_id": conversation_id,
             "attachments": attachments or [],
             "thread_id": thread_id,
+            "durable": durable,
         }
 
         plan: list[dict] = []           # chosen per intent after classification
@@ -876,6 +954,7 @@ class Orchestrator:
                                     preview=proposal.get("preview"),
                                     reasoning=proposal.get("reasoning", ""),
                                     summary=summary,
+                                    target=proposal.get("target", ""),
                                     sources=proposal.get("sources", []),
                                 )
                         else:
@@ -931,8 +1010,10 @@ class Orchestrator:
         self,
         *,
         thread_id: str,
-        decision: str,
+        decision: Optional[str] = None,
         approver_id: str,
+        batch_decisions: Optional[dict] = None,
+        answer: Optional[str] = None,
     ) -> AsyncGenerator[dict, None]:
         """Resume a run paused at the approval gate (durable mode only).
 
@@ -941,6 +1022,22 @@ class Orchestrator:
         token + execute via the gateway / reject) → grounded report → done. An
         expired pending record re-gates with a fresh ``approval_required`` instead
         of erroring (§2.3)."""
+        # R4b: a controller-loop run resumes through the controller graph (the act gate
+        # loops back to the controller after the report). Same client contract.
+        if settings.agent_controller_loop:
+            await _ensure_saver()
+            if not _GRAPH_DURABLE:
+                yield _event("error", message="durable runs are not available (Redis is unreachable)")
+                return
+            cgraph = await _get_controller_graph()
+            from agents.orchestrator import controller
+            async for ev in controller.run_controller_resume(
+                thread_id=thread_id, decision=decision, approver_id=approver_id, graph=cgraph,
+                batch_decisions=batch_decisions, answer=answer,
+            ):
+                yield ev
+            return
+
         graph = await _get_graph()
         if not _GRAPH_DURABLE:
             yield _event("error", message="durable runs are not available (Redis is unreachable)")

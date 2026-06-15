@@ -1,6 +1,9 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { AlertCircle, Copy, Check, ShieldQuestion, Loader2, FileText, Image as ImageIcon, CheckCircle2, XCircle, AlertTriangle } from 'lucide-react';
+import {
+  AlertCircle, Copy, Check, ShieldQuestion, Loader2, FileText, Image as ImageIcon,
+  CheckCircle2, XCircle, AlertTriangle, Sparkles, HelpCircle, Send, Link2,
+} from 'lucide-react';
 import SelfCorrectionBadge from '../chat/SelfCorrectionBadge';
 import PlanChecklist from './PlanChecklist';
 import ThinkingPanel from './ThinkingPanel';
@@ -13,6 +16,8 @@ export default function AgentMessage({
   onDocumentClick,
   onAttachmentClick,
   onResolveApproval,
+  onResolveBatch,
+  onAnswerQuestion,
 }) {
   const isUser = turn.role === 'user';
   const [copied, setCopied] = useState(false);
@@ -77,6 +82,9 @@ export default function AgentMessage({
       transition={{ duration: 0.3, ease: 'easeOut' }}
       className="w-full"
     >
+      {/* Loaded playbooks (skill_loaded) — quiet, above the plan */}
+      <SkillChips skills={turn.skills} />
+
       {/* Plan checklist (states by color + icon, no labels) */}
       <PlanChecklist steps={turn.plan} />
 
@@ -114,10 +122,19 @@ export default function AgentMessage({
         onAttachmentClick={onAttachmentClick}
       />
 
-      {/* Approval gate — a minimal inline card; the action's description renders
-          above it as normal output. Decide right here (Approve/Reject). */}
+      {/* Single-action approval gate — minimal inline card, task-specific label. */}
       {turn.approval && (
         <ApprovalGate approval={turn.approval} onResolve={onResolveApproval} />
+      )}
+
+      {/* Multi-action batch gate — one approval, per-action toggle. */}
+      {turn.batch && (
+        <BatchApprovalGate batch={turn.batch} threadId={turn.threadId} onResolve={onResolveBatch} />
+      )}
+
+      {/* The agent asked a question — inline answer input. */}
+      {turn.question && (
+        <QuestionGate question={turn.question} threadId={turn.threadId} onAnswer={onAnswerQuestion} />
       )}
 
       {/* Footer: verification badge + copy */}
@@ -141,6 +158,25 @@ export default function AgentMessage({
   );
 }
 
+// Quiet "following your <playbook>" chips when the agent loaded a skill.
+function SkillChips({ skills }) {
+  if (!skills?.length) return null;
+  return (
+    <div className="flex flex-wrap gap-1.5 mb-2">
+      {skills.map((sk) => (
+        <span
+          key={sk.name}
+          className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg bg-violet-500/8 border border-violet-500/20 text-[11px] text-violet-700"
+          title={`Playbook v${sk.version}`}
+        >
+          <Sparkles size={11} className="text-violet-500" />
+          Following your <span className="font-medium italic">{sk.name}</span> playbook
+        </span>
+      ))}
+    </div>
+  );
+}
+
 // A friendly, minimal label for an action from its connector + capability,
 // e.g. ("Notion", "notion-create-pages") → "Create pages · Notion".
 function actionLabel(connector, capability) {
@@ -153,28 +189,46 @@ function actionLabel(connector, capability) {
 }
 
 const RESOLVED = {
-  executed: { Icon: CheckCircle2, color: 'text-forest-500', word: 'Action completed' },
-  rejected: { Icon: XCircle, color: 'text-ink-500', word: 'Action rejected' },
-  failed: { Icon: AlertTriangle, color: 'text-terra-500', word: 'Action failed' },
+  executed: { Icon: CheckCircle2, color: 'text-forest-500', word: 'Completed' },
+  rejected: { Icon: XCircle, color: 'text-ink-500', word: 'Rejected' },
+  failed: { Icon: AlertTriangle, color: 'text-terra-500', word: 'Didn’t complete' },
+  blocked: { Icon: AlertTriangle, color: 'text-amber-700', word: 'Held back — needs a fresh approval' },
 };
 
-// Minimal inline action card. The agent's description of the action streams above it
-// as the answer body; this card just marks that an action happened here, with a short
-// label and its status — Approve/Reject inline while pending. No raw payload.
-function ApprovalGate({ approval, onResolve }) {
-  const { connector, capability, status, error } = approval;
+// The status sub-line for an action card. With a `target` the primary line shows the
+// specific thing (the page title / recipient); this line carries the action + status.
+function statusLine(status, { connector, capability, target, error }) {
   const label = actionLabel(connector, capability);
-  const resolved = ['executed', 'rejected', 'failed'].includes(status);
+  const word =
+    status === 'approving' ? 'Working…'
+    : status === 'pending' ? 'Needs your approval'
+    : status === 'failed' ? (error || RESOLVED.failed.word)
+    : RESOLVED[status]?.word || status;
+  // When the primary line already shows the target, repeat the action label here for
+  // context; otherwise the label is the primary line and we only show the status word.
+  return target ? `${label} · ${word}` : word;
+}
+
+// Minimal inline action card. The agent's description of the action streams above it as
+// the answer body; this card marks that an action happened here — now task-specific (the
+// page title / recipient on top) with its status. No raw payload, no "why".
+function ApprovalGate({ approval, onResolve }) {
+  const { connector, capability, target, status, error } = approval;
+  const label = actionLabel(connector, capability);
+  const primary = target || label;
+  const resolved = ['executed', 'rejected', 'failed', 'blocked'].includes(status);
   const approving = status === 'approving';
   const cfg = resolved ? RESOLVED[status] : null;
   const ResolvedIcon = cfg?.Icon;
+  const calm = resolved && status !== 'failed' && status !== 'blocked';
 
   return (
     <div className="mt-3">
-      {/* Minimal action card */}
       <div
         className={`rounded-xl border px-3.5 py-3 flex items-center gap-3 ${
-          resolved ? 'border-cream-200 bg-cream-50/60' : 'border-amber-700/30 bg-amber-50/50'
+          calm ? 'border-cream-200 bg-cream-50/60'
+          : resolved ? 'border-amber-700/30 bg-amber-50/40'
+          : 'border-amber-700/30 bg-amber-50/50'
         }`}
       >
         {resolved && ResolvedIcon ? (
@@ -184,15 +238,9 @@ function ApprovalGate({ approval, onResolve }) {
         )}
 
         <div className="flex-1 min-w-0">
-          <p className="text-sm font-medium text-ink-900 truncate">{label}</p>
-          <p className="text-[11px] text-ink-600">
-            {resolved
-              ? status === 'failed'
-                ? error || 'The action did not complete.'
-                : cfg.word
-              : approving
-                ? 'Working…'
-                : 'Needs your approval'}
+          <p className="text-sm font-medium text-ink-900 truncate">{primary}</p>
+          <p className="text-[11px] text-ink-600 truncate">
+            {statusLine(status, { connector, capability, target, error })}
           </p>
         </div>
 
@@ -215,6 +263,147 @@ function ApprovalGate({ approval, onResolve }) {
               </button>
             </div>
           ))}
+      </div>
+    </div>
+  );
+}
+
+// Multi-action gate (R6): one approval covering several actions, each with an
+// approve/deselect toggle. Parameterized actions are flagged ("derived"). Resume once.
+function BatchApprovalGate({ batch, threadId, onResolve }) {
+  const [decisions, setDecisions] = useState(() =>
+    Object.fromEntries(batch.items.map((it) => [it.pending_id, 'approve']))
+  );
+  const pending = batch.status === 'pending';
+  const working = batch.status === 'approving';
+  const toggle = (id) =>
+    setDecisions((d) => ({ ...d, [id]: d[id] === 'approve' ? 'reject' : 'approve' }));
+  const approveCount = Object.values(decisions).filter((v) => v === 'approve').length;
+
+  return (
+    <div className="mt-3 rounded-xl border border-amber-700/30 bg-amber-50/50 overflow-hidden">
+      <div className="px-3.5 py-2.5 flex items-center gap-2 border-b border-amber-700/15">
+        <ShieldQuestion size={15} className="text-amber-700 flex-shrink-0" />
+        <p className="text-xs font-medium text-ink-900">
+          {batch.items.length} actions need your approval
+        </p>
+      </div>
+
+      <div className="divide-y divide-cream-200/70">
+        {batch.items.map((it) => {
+          const primary = it.target || actionLabel(it.connector, it.capability);
+          const resolved = ['executed', 'rejected', 'failed', 'blocked'].includes(it.status);
+          const cfg = resolved ? RESOLVED[it.status] : null;
+          const ResolvedIcon = cfg?.Icon;
+          const selected = decisions[it.pending_id] === 'approve';
+          return (
+            <div key={it.pending_id} className="px-3.5 py-2.5 flex items-center gap-3">
+              {resolved && ResolvedIcon ? (
+                <ResolvedIcon size={16} className={`flex-shrink-0 ${cfg.color}`} />
+              ) : pending ? (
+                <input
+                  type="checkbox"
+                  checked={selected}
+                  onChange={() => toggle(it.pending_id)}
+                  className="flex-shrink-0 w-4 h-4 accent-amber-900 cursor-pointer"
+                />
+              ) : (
+                <Loader2 size={15} className="animate-spin text-ink-500 flex-shrink-0" />
+              )}
+
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <p className={`text-sm font-medium truncate ${pending && !selected ? 'text-ink-400 line-through' : 'text-ink-900'}`}>
+                    {primary}
+                  </p>
+                  {it.preview_status === 'parameterized' && (
+                    <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] font-medium bg-violet-500/10 text-violet-700 flex-shrink-0" title="Its arguments derive from an earlier action's result, within approved bounds.">
+                      <Link2 size={9} /> derived
+                    </span>
+                  )}
+                </div>
+                <p className="text-[11px] text-ink-600 truncate">
+                  {resolved
+                    ? statusLine(it.status, { connector: it.connector, capability: it.capability, target: it.target, error: it.error })
+                    : actionLabel(it.connector, it.capability)}
+                </p>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {pending && (
+        <div className="px-3.5 py-2.5 flex items-center justify-end gap-2 border-t border-amber-700/15">
+          <button
+            onClick={() => onResolve?.(threadId, Object.fromEntries(batch.items.map((it) => [it.pending_id, 'reject'])))}
+            className="px-3 py-1.5 text-xs font-medium rounded-lg bg-cream-100 text-ink-700 border border-cream-200 hover:bg-cream-200 active:scale-[0.98] transition-all"
+          >
+            Reject all
+          </button>
+          <button
+            onClick={() => onResolve?.(threadId, decisions)}
+            disabled={approveCount === 0}
+            className="px-3 py-1.5 text-xs font-medium rounded-lg bg-amber-900 text-white hover:bg-amber-950 disabled:opacity-40 active:scale-[0.98] transition-all"
+          >
+            {approveCount === batch.items.length ? 'Approve all' : `Approve ${approveCount}`}
+          </button>
+        </div>
+      )}
+      {working && (
+        <div className="px-3.5 py-2 text-[11px] text-ink-600 border-t border-amber-700/15">Carrying out the approved actions…</div>
+      )}
+    </div>
+  );
+}
+
+// Question gate (R7): the agent is blocked and asks the user. Inline answer input.
+function QuestionGate({ question, threadId, onAnswer }) {
+  const [value, setValue] = useState('');
+  const answered = question.status === 'answered';
+
+  const submit = (e) => {
+    e.preventDefault();
+    const text = value.trim();
+    if (!text) return;
+    onAnswer?.(threadId, text);
+  };
+
+  return (
+    <div className="mt-3 rounded-xl border border-violet-500/25 bg-violet-500/[0.04] px-3.5 py-3">
+      <div className="flex items-start gap-2.5">
+        <HelpCircle size={16} className="text-violet-500 flex-shrink-0 mt-0.5" />
+        <div className="flex-1 min-w-0">
+          <p className="text-sm text-ink-900">{question.text}</p>
+          {question.context && <p className="text-[11px] text-ink-600 mt-0.5">{question.context}</p>}
+
+          {answered ? (
+            <p className="mt-2 text-xs text-ink-700">
+              <span className="text-ink-500">You answered:</span> {question.answer}
+            </p>
+          ) : (
+            <form onSubmit={submit} className="mt-2 flex items-end gap-2">
+              <textarea
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) submit(e); }}
+                rows={1}
+                autoFocus
+                placeholder="Type your answer…"
+                className="flex-1 resize-none min-h-[36px] max-h-28 py-2 px-2.5 rounded-lg bg-white border border-cream-200
+                  text-ink-900 placeholder:text-cream-400 text-sm focus:outline-none focus:border-violet-400 focus:ring-2 focus:ring-violet-500/20 transition-all"
+              />
+              <button
+                type="submit"
+                disabled={!value.trim()}
+                className="flex-shrink-0 p-2 rounded-lg bg-violet-500 text-white hover:bg-violet-600 disabled:opacity-30 active:scale-95 transition-all"
+                title="Send answer"
+              >
+                <Send size={15} />
+              </button>
+            </form>
+          )}
+        </div>
       </div>
     </div>
   );

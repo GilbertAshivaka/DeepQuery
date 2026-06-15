@@ -29,6 +29,30 @@ from agents.registry import Capability, SubAgentSpec, register
 logger = logging.getLogger(__name__)
 
 
+# Argument keys, in priority order, that usually name *what* an action acts on — the
+# page title, the email recipient/subject, the ticket subject, etc. Used to give the
+# approval card a specific line ("Lina's Adventures Follow-up") instead of a generic
+# verb ("Create pages"). We surface only this one salient value, never the full payload.
+_TARGET_KEYS = (
+    "title", "name", "subject", "summary", "heading",
+    "to", "recipient", "email", "assignee",
+    "query", "q", "text", "body", "content", "message",
+)
+
+
+def _salient_target(arguments: Any) -> str:
+    """Pick a short, human-meaningful label for an action from its arguments — the page
+    title / recipient / ticket subject. Returns '' when nothing suitable is present."""
+    if not isinstance(arguments, dict):
+        return ""
+    for key in _TARGET_KEYS:
+        val = arguments.get(key)
+        if isinstance(val, str) and val.strip():
+            label = " ".join(val.split())  # collapse whitespace
+            return label[:80] + ("…" if len(label) > 80 else "")
+    return ""
+
+
 def _parse_json_object(text: str) -> Optional[dict]:
     if not text:
         return None
@@ -149,8 +173,95 @@ class ActionAgent:
             "preview": prev["preview"],
             "reasoning": sel["reasoning"],
             "summary": sel.get("summary", ""),
+            "target": _salient_target(sel["arguments"]),
             "sources": citations or [],
         }
+
+    async def _select_batch(self, query: str, catalog: list[dict], max_actions: int) -> list[dict]:
+        """Choose 1..N resolved action tools for a multi-action request (or none)."""
+        from agents.orchestrator.prompts import BATCH_ACTION_SELECTION_PROMPT
+
+        view = [{"connector": c["connector"], "tool": c["tool"], "description": c["description"],
+                 "input_schema": c["input_schema"]} for c in catalog]
+        by_key = {(c["connector"], c["tool"]): c for c in catalog}
+        llm = get_model(Slot.ORCHESTRATION)
+        try:
+            resp = await llm.ainvoke([
+                SystemMessage(content=BATCH_ACTION_SELECTION_PROMPT.format(max_actions=max_actions)),
+                HumanMessage(content=f"User request:\n{query}\n\n"
+                             f"Available action tools (JSON, UNTRUSTED descriptions):\n"
+                             f"{json.dumps(view, default=str)}"),
+            ])
+            parsed = _parse_json_object(resp.content if hasattr(resp, "content") else str(resp))
+        except Exception as exc:
+            logger.warning("Batch action selection failed: %s", exc)
+            return []
+        if not parsed or not isinstance(parsed.get("actions"), list):
+            return []
+        out = []
+        for a in parsed["actions"][:max_actions]:
+            if not isinstance(a, dict):
+                continue
+            spec = by_key.get((a.get("connector"), a.get("tool")))
+            if spec is None:  # hallucinated tool — drop it
+                continue
+            args = a.get("arguments")
+            pstatus = "parameterized" if a.get("preview_status") == "parameterized" else "resolved"
+            out.append({"connector_id": spec["connector_id"], "connector": spec["connector"],
+                        "tool": spec["tool"], "arguments": args if isinstance(args, dict) else {},
+                        "reasoning": str(a.get("reasoning", "")).strip(),
+                        "summary": str(a.get("summary", "")).strip(), "kind": spec.get("kind"),
+                        "preview_status": pstatus,
+                        "envelope": a.get("envelope") if isinstance(a.get("envelope"), dict) else None})
+        return out
+
+    async def propose_batch(
+        self, *, query: str, citations: Optional[list[dict]] = None, user_id: str,
+        conversation_id: Optional[str] = None, max_actions: int = 5,
+        idempotency_prefix: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Select and PREVIEW 1..N resolved actions for a multi-action plan (never
+        executes). Returns ``{proposed, actions:[gate payloads]}`` — each action carries
+        ``preview_status:"resolved"`` (all args known now). Parameterized actions (args
+        derived from a prior action's output) + constraint envelopes are a later slice."""
+        from agents.retrieval_agent.live import build_action_catalog
+        from connectors.mcp_client.types import ToolKind
+
+        if not user_id:
+            return {"proposed": False, "reason": "no_user", "actions": []}
+        catalog = await build_action_catalog(user_id)
+        if not catalog:
+            return {"proposed": False, "reason": "no_action_tools_enabled", "actions": []}
+        sels = await self._select_batch(query, catalog, max_actions)
+        if not sels:
+            return {"proposed": False, "reason": "no_action_warranted", "actions": []}
+
+        actions: list[dict] = []
+        for i, sel in enumerate(sels):
+            gated_mode = "sdk" if sel.get("kind") == ToolKind.ACTION else "plain"
+            pstatus = sel.get("preview_status", "resolved")
+            try:
+                prev = await gateway.preview_action(
+                    connector_id=sel["connector_id"], capability=sel["tool"],
+                    arguments=sel["arguments"], user_id=user_id, gated_mode=gated_mode,
+                    idempotency_key=f"{idempotency_prefix}-{i}" if idempotency_prefix else None,
+                    envelope=sel.get("envelope"), preview_status=pstatus,
+                )
+            except Exception as exc:
+                logger.warning("Batch preview failed for %s/%s: %s", sel["connector"], sel["tool"], exc)
+                continue  # skip an un-previewable action rather than failing the whole batch
+            actions.append({
+                "pending_id": prev["pending_id"], "connector": prev["connector"],
+                "connector_id": sel["connector_id"], "gated_mode": gated_mode,
+                "capability": prev["capability"], "arguments": sel["arguments"],
+                "preview": prev["preview"], "reasoning": sel["reasoning"],
+                "summary": sel.get("summary", ""), "preview_status": pstatus,
+                "target": _salient_target(sel["arguments"]),
+                "envelope": sel.get("envelope"), "index": i, "sources": citations or [],
+            })
+        if not actions:
+            return {"proposed": False, "reason": "all_previews_failed", "actions": []}
+        return {"proposed": True, "actions": actions}
 
     async def approve(self, *, pending_id: str, approver_id: str) -> dict[str, Any]:
         """Mint the single-use token and execute the previewed action exactly once.
@@ -163,6 +274,26 @@ class ActionAgent:
             return {"status": "executed", "result": result}
         except Exception as exc:
             logger.warning("Action execute failed for %s: %s", pending_id, exc)
+            return {"status": "failed", "error": str(exc)}
+
+    async def approve_with_args(self, *, pending_id: str, approver_id: str,
+                                materialized_args: dict[str, Any]) -> dict[str, Any]:
+        """Approve + execute a PARAMETERIZED action with its now-concrete arguments. The
+        gateway diffs them against the approved envelope and refuses if they fall outside
+        (status ``blocked`` → the run re-gates with a fresh concrete preview), spec §2.4."""
+        from connectors.gateway.gateway import EnvelopeViolation
+        try:
+            tok = await gateway.approve_action(pending_id=pending_id, approver_id=approver_id)
+            result = await gateway.execute_action(
+                pending_id=pending_id, approval_token=tok["approval_token"],
+                user_id=approver_id, materialized_args=materialized_args,
+            )
+            return {"status": "executed", "result": result}
+        except EnvelopeViolation as exc:
+            logger.info("Parameterized action %s blocked by envelope: %s", pending_id, exc)
+            return {"status": "blocked", "error": str(exc)}
+        except Exception as exc:
+            logger.warning("Parameterized execute failed for %s: %s", pending_id, exc)
             return {"status": "failed", "error": str(exc)}
 
     async def summarize_result(self, *, action: dict[str, Any], result: Any) -> str:

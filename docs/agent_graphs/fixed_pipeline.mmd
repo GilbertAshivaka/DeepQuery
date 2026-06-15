@@ -1,0 +1,34 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	classify(classify)
+	direct_answer(direct_answer)
+	retrieve(retrieve)
+	propose_action(propose_action)
+	generate(generate)
+	verify(verify)
+	await_approval(await_approval)
+	resolve_action(resolve_action)
+	report_action(report_action)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> classify;
+	await_approval --> resolve_action;
+	direct_answer --> __end__;
+	generate --> verify;
+	report_action --> __end__;
+	verify --> __end__;
+	classify -. &nbsp;direct&nbsp; .-> direct_answer;
+	classify -.-> retrieve;
+	retrieve -.-> propose_action;
+	retrieve -.-> generate;
+	propose_action -. &nbsp;await&nbsp; .-> await_approval;
+	propose_action -.-> generate;
+	resolve_action -. &nbsp;again&nbsp; .-> await_approval;
+	resolve_action -. &nbsp;report&nbsp; .-> report_action;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc

@@ -71,6 +71,118 @@ export function runAgent({ query, conversationId, attachmentIds }, onEvent, onDo
   return controller;
 }
 
+/**
+ * Resume a paused durable run via SSE (POST /api/agents/threads/{id}/resume).
+ *
+ * The continuation streams on the SAME thread (step_status → reasoning →
+ * answer_token×N → action_result → done), so the agent reports back what it did
+ * in the same conversation. `body` is one of:
+ *   { decision: 'approve'|'reject' }                  — single gate
+ *   { batch_decisions: { [pending_id]: 'approve'|'reject' } } — batch gate (R6)
+ *   { answer: '<the user's reply>' }                   — question gate (R7)
+ *
+ * Same fetch+reader pattern as runAgent (EventSource can't set the auth header).
+ * Returns an AbortController.
+ */
+export function resumeThread(threadId, body, onEvent, onDone, onError) {
+  return streamSSE(`/api/agents/threads/${threadId}/resume`, {
+    method: 'POST',
+    body: JSON.stringify(body || {}),
+  }, onEvent, onDone, onError);
+}
+
+/**
+ * Subscribe to a run's live event stream (GET /api/agents/threads/{id}/events).
+ *
+ * Replays from `lastEventId` (via ?last_event_id=) then tails live, so the UI can
+ * reattach after a reload/disconnect. Each frame carries an SSE `id:`; we surface
+ * it as `event.__seq` so the caller can track the cursor. Returns an AbortController.
+ */
+export function subscribeThreadEvents(threadId, lastEventId, onEvent, onDone, onError) {
+  const qs = lastEventId ? `?last_event_id=${encodeURIComponent(lastEventId)}` : '';
+  return streamSSE(`/api/agents/threads/${threadId}/events${qs}`, { method: 'GET' },
+    onEvent, onDone, onError);
+}
+
+/** Steer a running controller run (JSON, not SSE). mode ∈ augment|cancel_step|cancel_run. */
+export async function interjectThread(threadId, message, mode = 'augment') {
+  const { data } = await api.post(`/api/agents/threads/${threadId}/interject`, { message, mode });
+  return data; // {thread_id, queued, mode}
+}
+
+/** One-GET paint snapshot of a run (GET /api/agents/threads/{id}/state). */
+export async function getThreadState(threadId) {
+  const { data } = await api.get(`/api/agents/threads/${threadId}/state`);
+  return data; // {run_status, plan, trace, answer, citations, pending_approval, ...}
+}
+
+/**
+ * Shared SSE driver: fetch + stream-reader, parsing `data:`/`id:` frames. Tracks
+ * the SSE `id:` and attaches it to each event as `__seq` (for reconnect cursors).
+ * Returns an AbortController — abort to stop reading (the run continues server-side).
+ */
+function streamSSE(url, init, onEvent, onDone, onError) {
+  const controller = new AbortController();
+  const token = localStorage.getItem('access_token');
+
+  fetch(url, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+      ...(init.headers || {}),
+    },
+    signal: controller.signal,
+  })
+    .then(async (response) => {
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${response.status}`);
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let lastSeq = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        // SSE frames are separated by a blank line; split on \n and track id:/data:.
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('id: ')) {
+            lastSeq = line.slice(4).trim();
+            continue;
+          }
+          if (!line.startsWith('data: ')) continue;
+          const payload = line.slice(6);
+          if (payload === '[DONE]') {
+            onDone?.(lastSeq);
+            return;
+          }
+          try {
+            const event = JSON.parse(payload);
+            if (lastSeq != null) event.__seq = lastSeq;
+            onEvent?.(event);
+          } catch {
+            // ignore malformed / heartbeat frames
+          }
+        }
+      }
+      onDone?.(lastSeq);
+    })
+    .catch((err) => {
+      if (err.name !== 'AbortError') onError?.(err);
+    });
+
+  return controller;
+}
+
 // ── Attachments (user-provided docs/images) ─────────────────
 export async function uploadAttachment(file, conversationId) {
   const form = new FormData();

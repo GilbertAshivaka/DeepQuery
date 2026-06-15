@@ -31,6 +31,20 @@ from connectors.mcp_client.types import Discovery
 from core.database import SessionLocal
 
 
+# Per-connector concurrency caps (spec §2.7/§6) — one asyncio.Semaphore per connector,
+# created lazily inside the running loop. Bounds simultaneous calls to a single provider.
+_connector_sems: dict[str, "asyncio.Semaphore"] = {}
+
+
+def _connector_semaphore(connector_id: str) -> "asyncio.Semaphore":
+    from core.config import settings
+    sem = _connector_sems.get(connector_id)
+    if sem is None:
+        sem = asyncio.Semaphore(max(1, settings.agent_connector_max_concurrency))
+        _connector_sems[connector_id] = sem
+    return sem
+
+
 def _synthesize_preview(connector_name: str, capability: str, arguments: dict[str, Any]) -> str:
     """Build a human-readable preview for a non-SDK action without calling the tool
     (no dry-run exists for ecosystem servers — calling would execute it). The human
@@ -45,6 +59,64 @@ class GatewayError(Exception):
 
 class ConnectorNotFoundError(GatewayError):
     """The requested connector is not registered."""
+
+
+class EnvelopeViolation(GatewayError):
+    """A parameterized action's materialized arguments fell outside the approved
+    constraint envelope (spec §2.4). The gateway refuses to execute — the run must
+    re-present a fresh concrete preview for fresh approval."""
+
+
+def _synthesize_parameterized_preview(connector_name: str, capability: str,
+                                      template_args: dict[str, Any], envelope: dict[str, Any]) -> str:
+    """Preview for a parameterized action — its concrete args aren't known yet (they
+    derive from a prior action's result), so show the template + the approved bounds."""
+    args = json.dumps(template_args, indent=2, default=str) if template_args else "{}"
+    cons = json.dumps((envelope or {}).get("constraints", {}), indent=2, default=str)
+    src = (envelope or {}).get("derived_from", "an earlier action")
+    return (f"Run {connector_name}.{capability} once {src} completes, filling in the "
+            f"derived values. Template:\n{args}\n\nApproved bounds (enforced at run time):\n{cons}")
+
+
+def _within_envelope(template_args: dict[str, Any], materialized_args: dict[str, Any],
+                     envelope: dict[str, Any]) -> tuple[bool, str]:
+    """Diff the MATERIALIZED arguments against the approved envelope (the enforcement,
+    spec §2.4). Returns (ok, reason). Rules:
+      - no fields added or removed vs the approved template (no parameter injection);
+      - a field that was a ``${...}`` placeholder must satisfy its constraint
+        (``in`` / ``equals`` / ``derived``=just present & non-empty);
+      - a field that was concrete in the template must be UNCHANGED, unless a constraint
+        explicitly relaxes it."""
+    template_args = template_args or {}
+    materialized_args = materialized_args or {}
+    constraints = (envelope or {}).get("constraints", {}) or {}
+
+    tkeys, mkeys = set(template_args.keys()), set(materialized_args.keys())
+    if tkeys != mkeys:
+        added = mkeys - tkeys
+        removed = tkeys - mkeys
+        return False, f"argument fields changed (added={sorted(added)}, removed={sorted(removed)})"
+
+    for field, tval in template_args.items():
+        mval = materialized_args.get(field)
+        is_placeholder = isinstance(tval, str) and "${" in tval
+        rule = constraints.get(field)
+        if rule:
+            if "in" in rule and mval not in rule["in"]:
+                return False, f"field '{field}'={mval!r} not in allowed {rule['in']}"
+            if "equals" in rule and mval != rule["equals"]:
+                return False, f"field '{field}'={mval!r} must equal {rule['equals']!r}"
+            if rule.get("derived") and (mval is None or mval == ""):
+                return False, f"derived field '{field}' is empty"
+        elif is_placeholder:
+            # A placeholder with no explicit constraint: must at least resolve to a value.
+            if mval is None or mval == "" or (isinstance(mval, str) and "${" in mval):
+                return False, f"derived field '{field}' did not resolve"
+        else:
+            # Concrete field, no constraint → must be untouched.
+            if mval != tval:
+                return False, f"field '{field}' changed from {tval!r} to {mval!r}"
+    return True, ""
 
 
 class ConnectorGateway:
@@ -199,11 +271,14 @@ class ConnectorGateway:
                 return {**cached, "cache_hit": True}
 
         # 4. Circuit breaker, then inject the user's credential and call the connector.
+        #    A per-connector concurrency cap (spec §2.7/§6) bounds simultaneous live calls
+        #    so a wide controller read fan-out can't trip provider rate limits.
         self._breaker_check(ref)
         client = await self._make_client(ref, user_id)
         started = time.perf_counter()
         try:
-            result = await client.read(capability, arguments or {})
+            async with _connector_semaphore(ref.id):
+                result = await client.read(capability, arguments or {})
         except MCPClientError as exc:
             circuit_breaker.record_failure(ref.name, str(exc))
             latency = int((time.perf_counter() - started) * 1000)
@@ -350,6 +425,8 @@ class ConnectorGateway:
         enforce_governance: bool = True,
         gated_mode: str = "sdk",
         idempotency_key: Optional[str] = None,
+        envelope: Optional[dict[str, Any]] = None,
+        preview_status: str = "resolved",
     ) -> dict[str, Any]:
         """Preview an action (no execution) and open a pending-approval record.
 
@@ -374,7 +451,12 @@ class ConnectorGateway:
             if existing is not None:
                 return {"pending_id": existing["pending_id"], "connector": ref.name,
                         "capability": capability, "preview": existing["preview"]}
-        if gated_mode == "plain":
+        if preview_status == "parameterized":
+            # Concrete args aren't known yet (they derive from a prior action's result);
+            # we can't dry-run. Show the template + the envelope; the GATEWAY enforces the
+            # materialized args against that envelope at execute time.
+            preview = _synthesize_parameterized_preview(ref.name, capability, arguments or {}, envelope or {})
+        elif gated_mode == "plain":
             preview = _synthesize_preview(ref.name, capability, arguments or {})
         else:
             client = await self._make_client(ref, user_id)
@@ -388,7 +470,7 @@ class ConnectorGateway:
         pending_id = await asyncio.to_thread(
             action_gate.request, connector_id=ref.id, connector_name=ref.name,
             capability=capability, arguments=arguments, user_id=user_id, preview=preview, mode=gated_mode,
-            idempotency_key=idempotency_key,
+            idempotency_key=idempotency_key, envelope=envelope, preview_status=preview_status,
         )
         await asyncio.to_thread(self._audit_action, ref, capability, "preview", "success", user_id, None, None)
         return {"pending_id": pending_id, "connector": ref.name, "capability": capability, "preview": preview}
@@ -408,14 +490,29 @@ class ConnectorGateway:
             raise GatewayError(str(exc)) from exc
         return {"pending_id": pending_id, "status": "rejected"}
 
-    async def execute_action(self, *, pending_id: str, approval_token: str, user_id: Optional[str] = None) -> dict[str, Any]:
+    async def execute_action(self, *, pending_id: str, approval_token: str, user_id: Optional[str] = None,
+                             materialized_args: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         """Execute a previewed action — refused unless it carries a valid approval
-        token (the enforcement). Forwards execute to the connector and audits the
-        approver."""
+        token (the enforcement). For a PARAMETERIZED action (spec §2.4) the caller passes
+        the now-concrete ``materialized_args``; the gateway diffs them against the approved
+        envelope and REFUSES (``EnvelopeViolation``) if they fall outside — the run must
+        re-present a fresh concrete preview. Forwards execute to the connector and audits."""
         try:
             rec = await asyncio.to_thread(action_gate.consume_for_execute, pending_id, approval_token)
         except ActionGateError as exc:
             raise GatewayError(str(exc)) from exc
+
+        run_args = rec["arguments"]
+        if rec.get("preview_status") == "parameterized":
+            run_args = materialized_args if materialized_args is not None else rec["arguments"]
+            ok, reason = _within_envelope(rec["arguments"], run_args, rec.get("envelope") or {})
+            if not ok:
+                ref = await self._resolve(connector_id=rec["connector_id"], name=None)
+                await asyncio.to_thread(
+                    self._audit_action, ref, rec["capability"], "execute", "blocked",
+                    rec.get("user_id"), rec.get("approver_id"), f"envelope violation: {reason}",
+                )
+                raise EnvelopeViolation(reason)
 
         ref = await self._resolve(connector_id=rec["connector_id"], name=None)
         self._assert_deployment(ref)
@@ -424,9 +521,9 @@ class ConnectorGateway:
         try:
             if rec.get("mode") == "plain":
                 # Non-SDK tool: a single approved call (no two-phase protocol exists).
-                result = await client.execute_plain(rec["capability"], rec["arguments"])
+                result = await client.execute_plain(rec["capability"], run_args)
             else:
-                result = await client.execute_gated_action(rec["capability"], rec["arguments"])
+                result = await client.execute_gated_action(rec["capability"], run_args)
         except MCPClientError as exc:
             circuit_breaker.record_failure(ref.name, str(exc))
             await asyncio.to_thread(

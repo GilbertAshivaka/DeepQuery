@@ -51,6 +51,8 @@ class ActionGate:
         preview: str,
         mode: str = "sdk",
         idempotency_key: Optional[str] = None,
+        envelope: Optional[dict[str, Any]] = None,
+        preview_status: str = "resolved",
     ) -> str:
         pending_id = secrets.token_urlsafe(18)
         stored = redis_client.set_json(
@@ -66,6 +68,10 @@ class ActionGate:
                 # "sdk" = SDK two-phase preview/execute; "plain" = a single call on a
                 # non-SDK (ecosystem) tool, executed once on approval.
                 "mode": mode,
+                # "resolved" = concrete args; "parameterized" = args derive from a prior
+                # action's result, enforced against `envelope` at execute time (spec §2.4).
+                "preview_status": preview_status,
+                "envelope": envelope or None,
                 "status": "previewed",
                 "approver_id": None,
                 "approval_token": None,

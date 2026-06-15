@@ -6,18 +6,27 @@ Agents page drives these endpoints; the chat interface never does.
 
 POST /api/agents/run                          — run the Orchestrator (SSE events)
 POST /api/agents/threads/{thread_id}/resume   — resume a paused durable run (SSE)
+GET  /api/agents/threads/{thread_id}/state    — run snapshot (one-GET UI paint)
+GET  /api/agents/threads/{thread_id}/events   — SSE subscriber (Last-Event-ID replay)
 GET  /api/agents/health                       — model slots + capabilities
 
 SSE event types:
-  plan · step_status · reasoning · thinking · tool_activity · citations ·
-  answer_token · verification_result · approval_required · action_result ·
-  done · error
+  run_started · plan · step_status · reasoning · thinking · tool_activity ·
+  citations · answer_token · verification_result · approval_required ·
+  action_result · done · error
 
 Durable runs (RESUMABLE_AGENT_SPEC_V2 phase 1): an action run pauses at the
 approval gate (checkpointed in Redis under its per-run thread_id, carried in
-approval_required/done events) and the SAME run resumes via /threads/{id}/resume.
-The /actions/{pending_id}/approve|reject endpoints remain for the legacy
-non-durable fallback (Redis down) and the pre-resume UI.
+run_started/approval_required/done events) and the SAME run resumes via
+/threads/{id}/resume. The /actions/{pending_id}/approve|reject endpoints remain
+for the legacy non-durable fallback (Redis down) and the pre-resume UI.
+
+Event bus (phase R2 §2.5): every run also publishes its events to a per-run Redis
+Stream and maintains a snapshot, so /threads/{id}/events (replay + live tail via
+Last-Event-ID) and /threads/{id}/state (one-GET paint) give disconnect/multi-tab
+resilience. Execution is still in-request here; R3 moves it to an executor behind
+the same client contract. Bus writes are best-effort — the in-request SSE on /run
+is unaffected if Redis is briefly down.
 """
 
 import json
@@ -26,7 +35,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import AsyncGenerator, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -46,6 +55,9 @@ class AgentRunRequest(BaseModel):
     query: str
     conversation_id: Optional[str] = None
     attachment_ids: Optional[list[str]] = None
+    # Explicitly-selected playbooks to load up front (controller, R8). The controller may
+    # also discover + load others itself via the skill index.
+    skill_names: Optional[list[str]] = None
 
 
 def _sse(event: dict) -> str:
@@ -55,16 +67,17 @@ def _sse(event: dict) -> str:
 @router.post("/run")
 async def run_agent(
     body: AgentRunRequest,
+    request: Request,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Run the Orchestrator and stream its events as SSE, with cross-turn memory.
+    """Start an agent run and stream its events as SSE, with cross-turn memory.
 
-    Prior turns of the conversation are loaded as history (so follow-ups have
-    context). The user turn is persisted up front; the assistant turn is persisted
-    when the run completes. If the client disconnects mid-run (stop), the run is
-    cancelled and the assistant turn is not saved — the user turn remains, so a
-    follow-up ("steer") sees what was asked.
+    Prior turns of the conversation are loaded as history (so follow-ups have context),
+    and the user turn is persisted up front. Execution is owned by the in-process
+    **executor** (R3), not this request: the SSE below is a *subscriber* to the run's
+    event bus. So if the client disconnects mid-run, the run keeps going, the assistant
+    turn is still persisted, and the client can reattach via /threads/{id}/events.
     """
     allowed_collections = [
         c.value for c in ROLE_COLLECTIONS.get(UserRole(user.role), [])
@@ -117,95 +130,22 @@ async def run_agent(
             attachments.append({"filename": a.filename, "text": a.extracted_text or "", "kind": a.kind})
         db.commit()
 
-    async def event_stream() -> AsyncGenerator[str, None]:
-        from agents.orchestrator import orchestrator
+    # Per-run identity, generated up front so the event bus key is known before the
+    # first event and the client can reconnect via /threads/{id}/events.
+    thread_id = f"run-{uuid.uuid4().hex}"
 
-        answer_parts: list[str] = []
-        final: dict = {}
-        pending_approval: dict = {}
-        citations_payload = None
-        # CoT scaffolding to persist so the plan checklist + thinking timeline
-        # survive a reload (mirrors how the frontend store assembles them live).
-        plan_state: list[dict] = []
-        trace_acc: list[dict] = []
-        try:
-            async for event in orchestrator.run(
-                query=query,
-                allowed_collections=allowed_collections,
-                chat_history=chat_history,
-                user_id=user_id,
-                conversation_id=conversation_id,
-                attachments=attachments,
-            ):
-                t = event.get("type")
-                if t == "answer_token":
-                    answer_parts.append(event.get("content", ""))
-                elif t == "citations":
-                    citations_payload = event.get("citations") or event.get("content")
-                elif t == "plan":
-                    plan_state = event.get("steps") or []
-                elif t == "step_status":
-                    for s in plan_state:
-                        if s.get("id") == event.get("id"):
-                            s["status"] = event.get("status")
-                elif t == "thinking":
-                    # Coalesce consecutive CoT deltas into one block.
-                    if trace_acc and trace_acc[-1].get("kind") == "thinking":
-                        trace_acc[-1]["content"] += event.get("content", "")
-                    else:
-                        trace_acc.append({"kind": "thinking", "content": event.get("content", "")})
-                elif t == "reasoning":
-                    trace_acc.append({"kind": "reasoning", "text": event.get("text")})
-                elif t == "tool_activity":
-                    trace_acc.append({"kind": "tool", "tool": event.get("tool"),
-                                      "detail": event.get("detail"), "status": event.get("status")})
-                elif t == "approval_required":
-                    # Action runs end here (no `done`). Capture the gate payload so
-                    # the pending approval survives a page reload (rehydrated from
-                    # the turn's proposed_action).
-                    pending_approval = event
-                elif t == "done":
-                    final = event
-                yield _sse(event)
-        except Exception as exc:  # last-resort guard; run() already emits 'error'
-            yield _sse({"type": "error", "message": str(exc)})
-            return
+    # Hand execution to the in-process executor (it owns the orchestrator drive, bus
+    # publishing, and assistant-turn persistence) and return a bus subscriber. The run
+    # now outlives this request.
+    from agents.orchestrator import executor
 
-        # Persist the assistant turn (fresh session — request session is closed).
-        from core.database import SessionLocal
-        sdb = SessionLocal()
-        try:
-            verification = final.get("verification") or {}
-            citations = final.get("citations") or citations_payload
-            # An action run ends at approval_required with no `done`; persist that
-            # gate payload as proposed_action so a reload can rehydrate the gate.
-            proposed = final.get("proposed_action")
-            if not proposed and pending_approval:
-                proposed = {k: v for k, v in pending_approval.items() if k != "type"}
-            cot = {"plan": plan_state, "trace": trace_acc}
-            turn = AgentTurn(
-                conversation_id=conversation_id,
-                role="assistant",
-                content=final.get("answer") or "".join(answer_parts),
-                intent=final.get("intent") or ("action" if pending_approval else None),
-                citations=json.dumps(citations) if citations else None,
-                grounded=final.get("grounded"),
-                verification_status=verification.get("outcome"),
-                proposed_action=json.dumps(proposed) if proposed else None,
-                agent_trace=json.dumps(cot) if (plan_state or trace_acc) else None,
-            )
-            sdb.add(turn)
-            c = sdb.query(AgentConversation).filter(AgentConversation.id == conversation_id).first()
-            if c is not None:
-                c.updated_at = datetime.now(timezone.utc)
-            sdb.commit()
-        except Exception:
-            sdb.rollback()
-        finally:
-            sdb.close()
-
+    executor.start_run(
+        thread_id=thread_id, query=query, allowed_collections=allowed_collections,
+        chat_history=chat_history, user_id=user_id, conversation_id=conversation_id,
+        attachments=attachments, skill_names=body.skill_names,
+    )
     return StreamingResponse(
-        event_stream(),
+        _bus_subscriber(thread_id, request, last_id=None),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -213,6 +153,28 @@ async def run_agent(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+async def _bus_subscriber(
+    thread_id: str, request: Request, last_id: Optional[str]
+) -> AsyncGenerator[str, None]:
+    """Stream a run's bus events as SSE: replay from ``last_id`` then tail live, with
+    ``id:`` frames (browser Last-Event-ID), heartbeats, and disconnect detection. Shared
+    by /run, /resume, and /events — the run keeps executing if the client drops."""
+    from agents.orchestrator import event_bus, executor
+
+    try:
+        async for seq, event in event_bus.subscribe(
+            thread_id, last_id, is_live=lambda: executor.is_running(thread_id)
+        ):
+            if await request.is_disconnected():
+                break
+            if event is None:
+                yield ": ping\n\n"
+                continue
+            yield f"id: {seq}\ndata: {json.dumps(event)}\n\n"
+    except Exception as exc:
+        yield _sse({"type": "error", "message": str(exc)})
 
 
 # ── Attachments (user-provided docs/images) ─────────────────
@@ -453,78 +415,41 @@ async def _post_action_continuation(pending_id: str, result_payload: dict) -> Op
 
 
 class ResumeRequest(BaseModel):
-    decision: str  # "approve" | "reject"
+    decision: Optional[str] = None  # single gate: "approve" | "reject"
+    # batch gate (R6): {pending_id: "approve"|"reject"} per action in the plan.
+    batch_decisions: Optional[dict] = None
+    answer: Optional[str] = None    # question gate (R7): the user's reply
+
+
+class InterjectRequest(BaseModel):
+    message: str
+    mode: Optional[str] = "augment"  # augment | cancel_step | cancel_run
 
 
 @router.post("/threads/{thread_id}/resume")
 async def resume_thread(
     thread_id: str,
     body: ResumeRequest,
+    request: Request,
     user: User = Depends(get_current_user),
 ):
-    """Resume a durable run paused at the approval gate, streaming the continuation
-    as SSE on the same event contract as /run: the decision flows into the
-    checkpointed run (approve → token + execute → grounded report; reject →
-    acknowledged), and the report is persisted as an assistant turn. Supersedes
-    /actions/{pending_id}/approve|reject for durable runs (those remain for the
-    legacy non-durable gate)."""
-    from agents.orchestrator import orchestrator
+    """Resume a durable run paused at the approval gate. Execution is handed to the
+    in-process executor (approve → token + execute → grounded report; reject →
+    acknowledged; resolution + report persisted), and the response subscribes to the
+    run's bus from the pause point, so only the *continuation* streams — surviving a
+    client drop like /run. Supersedes /actions/{pending_id}/approve|reject for durable
+    runs (those remain for the legacy non-durable gate)."""
+    from agents.orchestrator import executor
 
-    async def event_stream() -> AsyncGenerator[str, None]:
-        final: dict = {}
-        action_res: dict = {}
-        regate: dict = {}
-        try:
-            async for event in orchestrator.resume(
-                thread_id=thread_id, decision=body.decision, approver_id=user.id
-            ):
-                t = event.get("type")
-                if t == "action_result":
-                    action_res = event
-                elif t == "approval_required":
-                    regate = event
-                elif t == "done":
-                    final = event
-                yield _sse(event)
-        except Exception as exc:  # last-resort guard; resume() already emits 'error'
-            yield _sse({"type": "error", "message": str(exc)})
-            return
+    # Subscribe from the current snapshot tip so the response streams only the new
+    # continuation events (not a full replay of the already-seen run).
+    snap = await _authorize_thread(thread_id, user)
+    cursor = snap.get("last_event_id")
 
-        # Persist: stamp the proposing turn with the resolution, and record the
-        # post-action report as a fresh assistant turn (the agent reported back).
-        if action_res:
-            status_ = action_res.get("status") or "executed"
-            _persist_action_resolution(
-                action_res.get("pending_id") or "",
-                plan_status={"executed": "done", "rejected": "rejected"}.get(status_, "failed"),
-                resolved_status=status_,
-                error=action_res.get("error"),
-                thread_id=thread_id,
-            )
-            message = action_res.get("message") or final.get("answer")
-            conv_id = final.get("conversation_id")
-            if message and conv_id:
-                from core.database import SessionLocal
-                sdb = SessionLocal()
-                try:
-                    sdb.add(AgentTurn(conversation_id=conv_id, role="assistant",
-                                      content=message, intent="action"))
-                    c = sdb.query(AgentConversation).filter(AgentConversation.id == conv_id).first()
-                    if c is not None:
-                        c.updated_at = datetime.now(timezone.utc)
-                    sdb.commit()
-                except Exception:
-                    sdb.rollback()
-                finally:
-                    sdb.close()
-        elif regate:
-            # Expired pending record was refreshed: update the stored gate payload so
-            # a reload re-presents the NEW pending_id/preview, still awaiting approval.
-            _update_turn_gate(thread_id, pending_id=regate.get("pending_id"),
-                              preview=regate.get("preview"), regated=True)
-
+    executor.start_resume(thread_id=thread_id, decision=body.decision, approver_id=user.id,
+                          batch_decisions=body.batch_decisions, answer=body.answer)
     return StreamingResponse(
-        event_stream(),
+        _bus_subscriber(thread_id, request, last_id=cursor),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -560,6 +485,78 @@ def _update_turn_gate(thread_id: str, **fields) -> None:
         sdb.rollback()
     finally:
         sdb.close()
+
+
+async def _authorize_thread(thread_id: str, user: User) -> dict:
+    """Load a run's snapshot and confirm the caller owns it. Raises 404 (unknown/
+    expired) or 403 (another user's run)."""
+    from agents.orchestrator import event_bus
+
+    try:
+        snap = await event_bus.get_snapshot(thread_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"run state store unavailable: {exc}")
+    if snap is None:
+        raise HTTPException(status_code=404, detail="no such run (it may have expired)")
+    owner = snap.get("user_id")
+    if owner and owner != user.id:
+        raise HTTPException(status_code=403, detail="this run belongs to another user")
+    return snap
+
+
+@router.get("/threads/{thread_id}/state")
+async def get_thread_state(thread_id: str, user: User = Depends(get_current_user)):
+    """One-GET UI paint (RESUMABLE_AGENT_SPEC_V2 §2.5): the current snapshot — plan +
+    step statuses + accumulated answer + citations + any pending approval + run status +
+    ``last_event_id``. A client paints from this, then subscribes to /events from
+    ``last_event_id`` for replay-then-live."""
+    snap = await _authorize_thread(thread_id, user)
+    # Lazy restart-supervisor correction: a `running` run with no live task here died in a
+    # restart — report it `interrupted` rather than a stale `running`.
+    if snap.get("run_status") == "running":
+        from agents.orchestrator import executor
+        if not executor.is_running(thread_id):
+            snap = {**snap, "run_status": "interrupted"}
+    return {k: v for k, v in snap.items() if k != "user_id"}
+
+
+@router.get("/threads/{thread_id}/events")
+async def get_thread_events(
+    thread_id: str,
+    request: Request,
+    user: User = Depends(get_current_user),
+):
+    """SSE subscriber (RESUMABLE_AGENT_SPEC_V2 §2.5/§2.12). Honors ``Last-Event-ID``
+    (header, or ``?last_event_id=`` query param): replays missed events from the run's
+    Redis Stream, then tails live until the run finishes or pauses. Disconnect-safe and
+    multi-tab-safe — reconnect with the last id you saw to resume exactly."""
+    await _authorize_thread(thread_id, user)
+    last_id = request.headers.get("Last-Event-ID") or request.query_params.get("last_event_id")
+    return StreamingResponse(
+        _bus_subscriber(thread_id, request, last_id=last_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/threads/{thread_id}/interject")
+async def interject_thread(thread_id: str, body: InterjectRequest,
+                           user: User = Depends(get_current_user)):
+    """Steer a run mid-flight (RESUMABLE_AGENT_SPEC_V2 §2.9). The note goes to the run's
+    mailbox and is drained by the controller at its next loop boundary — `augment` ("also
+    do X") folds into the plan, `cancel_step` ("skip that") drops the current direction,
+    `cancel_run` wraps up gracefully. If the run is paused at a gate/question, the note is
+    read when it resumes. Controller runs only."""
+    from agents.orchestrator import event_bus
+
+    await _authorize_thread(thread_id, user)  # 404/403 if not the owner's run
+    mode = body.mode if body.mode in ("augment", "cancel_step", "cancel_run") else "augment"
+    ok = await event_bus.interject(thread_id, body.message, mode)
+    return {"thread_id": thread_id, "queued": ok, "mode": mode}
 
 
 @router.post("/actions/{pending_id}/approve")

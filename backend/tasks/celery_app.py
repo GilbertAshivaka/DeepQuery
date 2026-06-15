@@ -41,6 +41,7 @@ celery_app.autodiscover_tasks(["tasks"])
 import tasks.ingestion_task   # noqa: F401, E402
 import tasks.umap_task        # noqa: F401, E402
 import tasks.skill_sync_task  # noqa: F401, E402
+import tasks.agent_sweep_task  # noqa: F401, E402
 
 # ── Beat schedule (periodic tasks) ──────────────────────────
 from celery.schedules import crontab
@@ -50,5 +51,10 @@ celery_app.conf.beat_schedule = {
     "umap-nightly": {
         "task": "tasks.compute_umap_coordinates",
         "schedule": crontab(hour=2, minute=0),
+    },
+    # Sweep expired agent-run artifact dirs hourly (Redis keys self-expire; disk doesn't).
+    "agent-run-sweep-hourly": {
+        "task": "tasks.sweep_agent_runs",
+        "schedule": crontab(minute=0),
     },
 }

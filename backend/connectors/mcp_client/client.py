@@ -44,6 +44,40 @@ class MCPClientError(Exception):
     """A connector call failed at the protocol/transport level."""
 
 
+def _unwrap_cause(exc: BaseException) -> str:
+    """Unwrap ExceptionGroups (anyio / asyncio TaskGroup) down to the real underlying
+    cause(s), so a connector failure reads e.g. 'FileNotFoundError: ... duckduckgo-mcp' or
+    'connection refused' / 'auth 401' instead of the opaque 'unhandled errors in a
+    TaskGroup (1 sub-exception)'."""
+    leaves: list[str] = []
+
+    def _is_group(e: BaseException) -> bool:
+        # Built-in BaseExceptionGroup (3.11+) or anyio's backport (both expose .exceptions).
+        if isinstance(e, BaseExceptionGroup):
+            return True
+        subs = getattr(e, "exceptions", None)
+        return isinstance(subs, (list, tuple))
+
+    def walk(e: BaseException) -> None:
+        if _is_group(e):
+            for sub in getattr(e, "exceptions", []) or []:
+                walk(sub)
+            return
+        text = (str(e) or "").strip()
+        cls = type(e).__name__
+        if not text:
+            label = cls
+        elif cls.lower() in text.lower():
+            label = text
+        else:
+            label = f"{cls}: {text}"
+        if label not in leaves:
+            leaves.append(label)
+
+    walk(exc)
+    return "; ".join(leaves) or (str(exc) or type(exc).__name__)
+
+
 class MCPConnectorClient:
     """Talks MCP to a single connector over its configured transport."""
 
@@ -65,14 +99,14 @@ class MCPConnectorClient:
                             init = await session.initialize()
                     except Exception as exc:  # incompatible/raising server
                         raise MCPClientError(
-                            f"connector {self.config.name!r}: MCP initialize/negotiation failed: {exc}"
+                            f"connector {self.config.name!r}: MCP initialize/negotiation failed: {_unwrap_cause(exc)}"
                         ) from exc
                     yield session, init
         except MCPClientError:
             raise
         except Exception as exc:  # transport/connection failure
             raise MCPClientError(
-                f"connector {self.config.name!r}: transport error ({self.config.transport}): {exc}"
+                f"connector {self.config.name!r}: transport error ({self.config.transport}): {_unwrap_cause(exc)}"
             ) from exc
 
     # -- discovery --------------------------------------------------------
@@ -173,7 +207,7 @@ class MCPConnectorClient:
                     result = await session.call_tool(capability, arguments or {})
             except Exception as exc:
                 raise MCPClientError(
-                    f"connector {self.config.name!r}: read {capability!r} failed: {exc}"
+                    f"connector {self.config.name!r}: read {capability!r} failed: {_unwrap_cause(exc)}"
                 ) from exc
         if result.isError:
             text = next((b.text for b in result.content if getattr(b, "text", None)), "")
@@ -188,7 +222,7 @@ class MCPConnectorClient:
                 async with asyncio.timeout(self.timeout_s):
                     result = await session.read_resource(AnyUrl(uri))
             except Exception as exc:
-                raise MCPClientError(f"connector {self.config.name!r}: read_resource {uri!r} failed: {exc}") from exc
+                raise MCPClientError(f"connector {self.config.name!r}: read_resource {uri!r} failed: {_unwrap_cause(exc)}") from exc
         out: list[ResourceContent] = []
         for c in result.contents:
             out.append(
@@ -208,7 +242,7 @@ class MCPConnectorClient:
                 async with asyncio.timeout(self.timeout_s):
                     result = await session.get_prompt(name, arguments or {})
             except Exception as exc:
-                raise MCPClientError(f"connector {self.config.name!r}: get_prompt {name!r} failed: {exc}") from exc
+                raise MCPClientError(f"connector {self.config.name!r}: get_prompt {name!r} failed: {_unwrap_cause(exc)}") from exc
         messages: list[PromptMessageView] = []
         for m in result.messages:
             text = getattr(m.content, "text", None) or ""
@@ -223,7 +257,7 @@ class MCPConnectorClient:
                 async with asyncio.timeout(self.timeout_s):
                     result = await session.call_tool(capability, arguments or {})
             except Exception as exc:
-                raise MCPClientError(f"connector {self.config.name!r}: preview {capability!r} failed: {exc}") from exc
+                raise MCPClientError(f"connector {self.config.name!r}: preview {capability!r} failed: {_unwrap_cause(exc)}") from exc
         if result.isError:
             text = next((b.text for b in result.content if getattr(b, "text", None)), "")
             raise MCPClientError(f"connector {self.config.name!r}: preview {capability!r} errored: {text}")
@@ -241,7 +275,7 @@ class MCPConnectorClient:
                 async with asyncio.timeout(self.timeout_s):
                     preview = await session.call_tool(capability, arguments or {})
             except Exception as exc:
-                raise MCPClientError(f"connector {self.config.name!r}: action {capability!r} failed: {exc}") from exc
+                raise MCPClientError(f"connector {self.config.name!r}: action {capability!r} failed: {_unwrap_cause(exc)}") from exc
             if preview.isError:
                 text = next((b.text for b in preview.content if getattr(b, "text", None)), "")
                 raise MCPClientError(f"connector {self.config.name!r}: action {capability!r} errored: {text}")
@@ -252,7 +286,7 @@ class MCPConnectorClient:
                 async with asyncio.timeout(self.timeout_s):
                     executed = await session.call_tool(_EXECUTE_TOOL, {"approval_token": token})
             except Exception as exc:
-                raise MCPClientError(f"connector {self.config.name!r}: execute {capability!r} failed: {exc}") from exc
+                raise MCPClientError(f"connector {self.config.name!r}: execute {capability!r} failed: {_unwrap_cause(exc)}") from exc
             if executed.isError:
                 text = next((b.text for b in executed.content if getattr(b, "text", None)), "")
                 raise MCPClientError(f"connector {self.config.name!r}: execute {capability!r} errored: {text}")
@@ -268,7 +302,7 @@ class MCPConnectorClient:
                 async with asyncio.timeout(self.timeout_s):
                     result = await session.call_tool(capability, arguments or {})
             except Exception as exc:
-                raise MCPClientError(f"connector {self.config.name!r}: action {capability!r} failed: {exc}") from exc
+                raise MCPClientError(f"connector {self.config.name!r}: action {capability!r} failed: {_unwrap_cause(exc)}") from exc
         if result.isError:
             text = next((b.text for b in result.content if getattr(b, "text", None)), "")
             raise MCPClientError(f"connector {self.config.name!r}: action {capability!r} errored: {text}")

@@ -50,6 +50,13 @@ async def lifespan(app: FastAPI):
     print("Warming up external service connections...")
     await _warmup_connections()
 
+    # 5. Reconcile agent runs orphaned by a restart (best-effort; needs Redis).
+    try:
+        from agents.orchestrator.executor import reconcile_orphaned_runs
+        await reconcile_orphaned_runs()
+    except Exception as exc:
+        logger.warning("Agent run reconciliation skipped: %s", exc)
+
     print("=" * 60)
     print("✓ Server ready to accept traffic")
     print("=" * 60)

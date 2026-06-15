@@ -1,0 +1,51 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	hydrate(hydrate)
+	controller(controller)
+	read(read)
+	answer_step(answer_step)
+	load_skill_step(load_skill_step)
+	replan(replan)
+	finalize(finalize)
+	ask_step(ask_step)
+	prepare_action(prepare_action)
+	await_approval(await_approval)
+	resolve_action(resolve_action)
+	report_action(report_action)
+	await_batch_approval(await_batch_approval)
+	resolve_batch(resolve_batch)
+	report_batch(report_batch)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> hydrate;
+	answer_step --> finalize;
+	ask_step --> controller;
+	await_approval --> resolve_action;
+	await_batch_approval --> resolve_batch;
+	finalize --> __end__;
+	hydrate --> controller;
+	load_skill_step --> controller;
+	read --> controller;
+	replan --> controller;
+	report_action --> controller;
+	report_batch --> controller;
+	resolve_batch --> report_batch;
+	prepare_action -. &nbsp;await&nbsp; .-> await_approval;
+	prepare_action -. &nbsp;batch&nbsp; .-> await_batch_approval;
+	prepare_action -.-> controller;
+	resolve_action -. &nbsp;again&nbsp; .-> await_approval;
+	resolve_action -. &nbsp;report&nbsp; .-> report_action;
+	controller -.-> read;
+	controller -. &nbsp;answer&nbsp; .-> answer_step;
+	controller -.-> replan;
+	controller -. &nbsp;done&nbsp; .-> finalize;
+	controller -. &nbsp;load_skill&nbsp; .-> load_skill_step;
+	controller -. &nbsp;ask&nbsp; .-> ask_step;
+	controller -. &nbsp;act&nbsp; .-> prepare_action;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc

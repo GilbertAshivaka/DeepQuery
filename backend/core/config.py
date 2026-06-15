@@ -109,6 +109,41 @@ class Settings(BaseSettings):
     # Redis is unreachable at startup — the orchestrator compiles without a
     # checkpointer and behaves exactly as before (single-pass, no resume).
     agent_durable_runs: bool = True
+    # Controller loop (RESUMABLE_AGENT_SPEC_V2 §2.2, phase R4). When True, runs use the
+    # bounded plan→execute→observe controller instead of the fixed
+    # classify→retrieve→generate→verify pipeline. Default False — the controller is
+    # opt-in until proven; the fixed pipeline stays the default and is unaffected.
+    # Requires durable runs (the loop checkpoints + interrupts).
+    agent_controller_loop: bool = False
+    # Runaway fuse for the controller loop (spec §2.8): hard ceiling on controller
+    # iterations per run. Not pacing — a coherent run finishes well under this.
+    agent_controller_max_steps: int = 50
+    # Context discipline + sprawl control (spec §2.7–2.8), phase R5.
+    # Per-run token budget (rough char/4 estimate of working context); crossing it
+    # triggers a graceful wrap-up. 0 disables. Set from observed single-pass costs ×10.
+    agent_controller_token_budget: int = 120000
+    # Stall detector: this many consecutive reads that add no new evidence forces a
+    # re-plan; a second stall after that wraps up gracefully (spec §2.8).
+    agent_controller_stall_threshold: int = 3
+    # Bound the raw context carried in working state across reads (older raw payloads
+    # live in the artifact store, not the checkpoint). Keeps long runs from bloating
+    # the checkpoint; the per-read distilled findings preserve provenance.
+    agent_controller_max_context_chunks: int = 40
+    # Artifact store root (disk; spec §2.7). Empty → <document_store>/agent_artifacts.
+    # A persistent volume is required in deployment; multi-host later = adapter swap.
+    agent_artifact_root: str = ""
+    # Compaction (spec §2.7): when working-context tokens cross this, the controller
+    # LLM-summarizes older raw evidence into a dense finding and drops the raw (it stays
+    # in the artifact store). Lower than the token-budget fuse — densify, don't wrap up.
+    # 0 disables (the FIFO context cap still bounds growth). ~60% of the working window.
+    agent_controller_compaction_threshold: int = 60000
+    agent_controller_compaction_keep_recent: int = 8   # raw chunks kept un-compacted
+    # Parallel map-reduce reads (spec §2.7): a read step may fan out into this many
+    # concurrent sub-reads, each distilled then merged.
+    agent_max_parallel_reads: int = 5
+    # Per-connector concurrency cap (spec §2.7/§6): bounds simultaneous live calls to one
+    # connector so a wide fan-out can't trip provider rate limits.
+    agent_connector_max_concurrency: int = 3
     # How long a paused run remains resumable. The TTL sweeper expires older
     # checkpoints (a paused approval older than this requires a fresh run).
     agent_run_ttl_hours: int = 72

@@ -278,7 +278,196 @@ gate TTL vs multi-day pause) re-previews + re-gates, never errors.
 report turn); old `/actions/{id}/approve|reject` kept for legacy fallback + current UI.
 Verified: 17-check e2e (pause/resume across orchestrator instances, reject, double-resume,
 wrong-user, doc-path regression) + 6-check legacy-fallback suite, live endpoint check.
-**Next: R2 event bus + snapshot → R3 executor ownership → R4 controller loop** (spec §4).
+
+**Phase R2 — Event bus + snapshot ✅ DONE (2026-06-14).** Every run mirrors its events to
+a per-run Redis **Stream** (`agent:run:{tid}:events`, XADD monotonic IDs, MAXLEN-capped)
+and folds them into a **snapshot** (`agent:run:{tid}:snapshot`) — new module
+[event_bus.py](backend/agents/orchestrator/event_bus.py). `thread_id` hoisted to the API
+(generated per run, passed into `run()`; idempotency/resume gated on `durable` so legacy
+behavior is unchanged). New first event `run_started{thread_id}`. New subscriber endpoints:
+`GET /threads/{id}/state` (one-GET paint snapshot) and `GET /threads/{id}/events` (SSE,
+`Last-Event-ID` replay-then-live-tail with `id:` frames + heartbeats, terminal-aware).
+`/run` and `/resume` publish through the bus (best-effort — a Redis hiccup never breaks the
+in-request SSE). Execution still in-request (R3 moves it behind the same contract).
+`UI_HANDOFF.md` §3/§3a/§8 updated. Verified: 21-check bus suite (fold, snapshot, replay,
+reconnect-cursor, resume continuation, live tail, doc run) + R1 suites still green (17+6),
+live endpoint registration.
+
+**Phase R3 — Executor ownership ✅ DONE (2026-06-14).** Execution moved off the request
+into an in-process asyncio **executor** ([executor.py](backend/agents/orchestrator/executor.py),
+decision §5: one service, not a separate worker). `/run` and `/resume` now register a run
+task and return a **bus subscriber** (`_bus_subscriber` SSE: replay-from-cursor → live tail
+→ heartbeats → disconnect detection); the executor owns the orchestrator drive, bus
+publishing, AND assistant-turn persistence — so a client can disconnect/reload mid-run and
+the run still finishes and persists, then reattach via `/threads/{id}/events`. `/resume`
+subscribes from the pause cursor (`snapshot.last_event_id`) so only the continuation
+streams. Restart safety: `executor.is_running()` feeds an `is_live` guard in
+`event_bus.subscribe` so a subscriber never tails a run whose producer died in a restart
+(stops after replay instead of hanging). **Client contract unchanged from R2** (same events,
+same bus — only the producer moved), so no UI rework. Verified: 11-check executor suite
+(no-subscriber completion + persistence, `is_running` lifecycle, dead-run no-hang, action
+pause→resume persistence) + R1/R2 suites still green (17+6+21), clean boot + endpoint
+registration.
+
+**Phase R4a — Controller loop (read-only) ✅ DONE (2026-06-14).** The bounded
+plan→execute→observe loop, gated behind `agent_controller_loop` (default OFF — the fixed
+pipeline stays the default and is byte-for-byte unaffected). New module
+[controller.py](backend/agents/orchestrator/controller.py): nodes
+hydrate→controller→(read|answer_step|replan|finalize), a cyclic graph. The controller emits
+a **structured decision** (`read|answer|replan|done`) via the orchestration slot, with a
+JSON schema ([CONTROLLER_DECISION_PROMPT](backend/agents/orchestrator/prompts.py)),
+**repair-retry**, a **runaway fuse** (`agent_controller_max_steps`, default 50), decision
+logging (the Q9 eval corpus), and visible-failure recovery (parse failure → still answers,
+never a silent default/hang). Events stream via LangGraph's **custom channel**
+(`get_stream_writer`, verified available in 0.2.76) so the loop emits the IDENTICAL event
+contract (plan/step_status/reasoning/thinking/tool_activity/citations/answer_token/
+verification_result/done) — API/executor/bus/UI unchanged. Reuses `gather`, the
+generation/verification slots, and every formatting helper (not a fork; shares `AgentState`
++ the saver via `_ensure_saver`/`_get_controller_graph`). Dispatch is one branch at the top
+of `Orchestrator.run()`. Covers document/live/both/direct queries; dynamic plan grows as
+the controller decides steps. Verified: 11-check controller suite (read→answer→done same
+contract, direct-no-read, step fuse, parse-failure recovery) + R1/R2/R3 suites still green
+(17+6+21+11) with the flag off + clean imports.
+
+**Phase R4b — `act` in the loop ✅ DONE (2026-06-14).** The `act` decision runs the R1
+two-node gate INSIDE the controller loop, so the agent continues after an action:
+read→…→**act → prepare → await_approval (interrupt) → resolve → report → controller →
+done**. New gate nodes in [controller.py](backend/agents/orchestrator/controller.py)
+(prepare_action/await_approval/resolve_action/report_action) reuse `action_agent`
+.propose/approve/reject/summarize_result + the gateway (idempotency keyed `{thread_id}:act-{n}`,
+expiry re-gate) and stream via the custom channel — identical approval/`action_result`
+contract to the fixed gate. Gate nodes are added only when a checkpointer exists; without
+one the `act` route falls back to `answer` (can't pause). `run_controller` catches the
+loop's `__interrupt__` (updates channel) → emits `approval_required` + `done{paused:true}`;
+new `run_controller_resume` feeds `Command(resume=…)` and forwards the continuation;
+`Orchestrator.resume` branches to it when the flag is on. `report_action` loops back to the
+controller (the run CONTINUES after an action — the core resumable win, now in the loop).
+Verified: 12-check act suite (pause, resume-across-instances execute+report+continue,
+reject, read-only unaffected) + R4a (11) + R1/R2/R3 suites green (17+6+21+11) + clean
+imports. **R4 (a+b) complete.**
+
+**Phase R5 (partial) — context discipline + sprawl control ✅ core DONE (2026-06-14),
+spec §2.7–2.8.** New disk **artifact store**
+([artifacts.py](backend/agents/orchestrator/artifacts.py)) behind a thin
+`put/get/exists/delete/delete_thread` interface, keyed `{root}/{thread_id}/{step_id}/{id}`
+(root = `agent_artifact_root` or `<document_store>/agent_artifacts`; local-disk adapter,
+S3 swap later). The controller `read_node` now **offloads each read's raw payload to the
+store** (refs in state) and **bounds the accumulated working context**
+(`agent_controller_max_context_chunks`, default 40) so the checkpoint can't bloat across a
+long run — distilled one-line findings preserve provenance. **Sprawl control** in
+`controller_node` (all graceful wrap-ups, never dead drops): **stall detection** (a repeated
+unproductive read, or `agent_controller_stall_threshold`=3 consecutive empty reads → forced
+re-plan; a second stall → wrap up with what we have), a **per-run token-budget fuse**
+(`agent_controller_token_budget`=120k, char/4 estimate), plus the existing step fuse.
+Verified: 12-check R5 suite (artifact roundtrip, read archiving, stall escalation bounded
+below the step fuse, token fuse) + R4a/R4b + R1/R2/R3 suites green (11+12+11+17+6+21+11 = 90
+total) + clean imports.
+
+**R5 remainder (deferred, documented):** the LLM **compaction node** (threshold-triggered
+summarization of older findings, pinned-items-exempt — the bounded-context cap above is the
+lightweight stand-in); **true multi-query parallel map-reduce reads** (the controller emits
+one read/step today; gather already runs doc+live concurrently internally); **per-connector
+concurrency caps in the gateway** for ≤5-wide fan-out; and a **question interrupt** on a
+second stall (currently wraps up — the interrupt machinery lands with R7).
+
+**Phase R6 — Multi-action + batch approval ✅ core DONE (2026-06-14), spec §2.4.** The
+controller's `act` step now proposes a **plan of actions** (`action_agent.propose_batch` +
+[BATCH_ACTION_SELECTION_PROMPT](backend/agents/orchestrator/prompts.py)): one action → the
+unchanged single-gate flow; several → a **batch gate** (new controller nodes
+await_batch_approval/resolve_batch/report_batch). The batch interrupt emits
+`batch_approval_required` with a **typed preview per action** (`preview_status:"resolved"`)
+and a **per-action toggle**; resume carries `{batch_decisions:{pending_id:approve|reject}}`
+(plumbed through `Orchestrator.resume` → `run_controller_resume` → executor →
+`ResumeRequest`). Approved actions execute serially (gateway still the sole enforcer),
+deselected ones are skipped, and a **combined report** (one line/action + per-action
+`action_result`) streams before the loop continues to done. `UI_HANDOFF.md` §3/§8 updated.
+Verified: 10-check batch suite (pause with 3 typed previews, approve-2-reject-1 →
+execute+skip+combined report+continue, single-action still simple gate) + all prior suites
+green (12+12+11+17+6+21+11 = **100 total**) + clean imports.
+
+**R6 parameterized actions + envelopes ✅ DONE (2026-06-14).** The §2.4 action-chaining
+half: a batch action may be `parameterized` — its args reference an earlier action's result
+via `${actionN.result.path}` placeholders, and it carries a declared **constraint envelope**
+(`{derived_from, constraints:{field:{in|equals|derived}}, max_executions}`). At batch time
+the gateway synthesizes a template preview (no dry-run — concrete args unknown). At execute
+time the controller **materializes** the args from prior results in-order and
+`gateway.execute_action(materialized_args)` runs `_within_envelope` — the enforcement:
+no added/removed fields, concrete fields unchanged, derived fields satisfy their constraint.
+Out of bounds → `EnvelopeViolation` (gateway REFUSES — never executes out-of-envelope) →
+the action is `blocked`, reported held-back, and re-gated via the loop's single act path
+(fresh concrete preview). `action_agent.propose_batch` emits parameterized actions +
+`approve_with_args`; `BATCH_ACTION_SELECTION_PROMPT` teaches placeholders + envelopes.
+Verified: 14-check suite (envelope diff edge cases, materialization, in-envelope executes,
+**tampered → blocked not executed**) + all prior suites green (**114 total**). **R6 fully
+complete.**
+
+**Phase R7 — Question interrupt + interjection mailbox ✅ DONE (2026-06-14), spec §2.3/§2.9.**
+New `ask` controller decision → `ask_node` interrupts with a `question` payload; on resume
+the user's `answer` lands in findings and the loop continues (same two-node, replay-safe
+pattern as the gates). **Interjection mailbox**: `event_bus.interject/drain_mailbox` on a
+per-run Redis list; the controller drains it at the loop top (spec §2.9) — `augment` /
+`cancel_step` fold into findings (the controller plans against them), `cancel_run` wraps up
+gracefully. New `POST /threads/{id}/interject`; new `question` SSE event + `awaiting_input`
+run status + `pending_question` snapshot field. The unified `Command(resume)` payload now
+carries `{decision, approver_id, batch_decisions, answer}` — each paused node reads its own
+field — plumbed through `Orchestrator.resume`/`run_controller_resume`/executor/`ResumeRequest`.
+`UI_HANDOFF.md` §3/§3a/§3b updated. Verified: 10-check R7 suite (mailbox roundtrip, question
+pause→answer→continue with the answer in findings, augment folded in, cancel_run wrap-up) +
+all prior suites green (**124 total**). (R5's second-stall still wraps up; turning it into an
+`ask` is a one-line swap now that the machinery exists.)
+
+**Phase R8 — Skills consumption ✅ DONE (2026-06-14), spec §2.10. LAST FEATURE PHASE.**
+The consumption side of the skills subsystem, finally wired. New
+[skills.py](backend/agents/orchestrator/skills.py): `get_skill_index` ({name,description,
+kind} for active skills — loaded at hydration, the controller always plans with it) and
+`load_skill_snapshot` (snapshots a skill at its current version — **pinned by value** into
+run state, so a paused run resumes under the version it started with). New `load_skill`
+controller decision → `load_skill_node`: **two channels** — `body` → the pinned instruction
+channel (`loaded_skills`, surfaced to the controller prompt AND the answer generation as
+admin-authored instructions), `fact_sections` → the evidence channel (findings, citable).
+**Both entry paths**: controller-discovered (index match → `load_skill`) and explicit
+(`/run` `skill_names` → loaded at hydration). **Inform-never-authorize**: `metadata_json`
+connectors surface as a "prefer these tools" focus hint that explicitly grants no new
+permissions — the gateway stays the sole enforcer. New `skill_loaded{name,version}` event
+(+ snapshot trace fold). `UI_HANDOFF.md` §3 updated. Verified: 10-check R8 suite (index in
+context, load_skill → pinned body + facts-as-evidence + event, explicit selection at
+hydration, body injected into generation, unknown-skill graceful) + all prior suites green
+(**134 total**) + clean boot with all endpoints registered.
+
+## 5d. Resumable agent — ALL FEATURE PHASES COMPLETE (R1–R8)
+
+The durable, resumable, disconnect-surviving, sprawl-bounded controller agent is fully
+built behind `agent_controller_loop` (default OFF — the fixed pipeline is the default and
+untouched). 145 test checks across 12 suites.
+
+**Deferred work — ✅ ALL DONE (2026-06-14):**
+- **§2.7 Compaction node**: threshold-triggered (`agent_controller_compaction_threshold`,
+  ~60% of window) — once working-context tokens cross it, the controller LLM-summarizes
+  older raw evidence ([COMPACTION_PROMPT](backend/agents/orchestrator/prompts.py),
+  citation-preserving) into one dense finding and drops the raw (safe in the artifact store);
+  pinned items exempt (skill bodies, plan, recent findings + last K raw chunks). Densifies
+  *below* the budget fuse so a long run continues.
+- **§2.7 Multi-query parallel map-reduce reads**: a read decision may carry
+  `queries:[{query,sources}]` → up to `agent_max_parallel_reads` (5) concurrent sub-reads
+  (`asyncio.gather`), each archived + distilled, merged into the bounded context.
+- **§2.7 Per-connector concurrency caps**: `_connector_semaphore` in the gateway read path
+  (`agent_connector_max_concurrency`, 3) so a wide fan-out can't trip provider rate limits.
+- **Startup supervisor**: `executor.reconcile_orphaned_runs()` (called from the FastAPI
+  lifespan) marks restart-orphaned `running` snapshots `interrupted`; `/state` also applies
+  the lazy `is_live` correction. (`interrupted` is now a terminal status so subscribers stop.)
+- **TTL sweeper**: [sweeper.py](backend/agents/orchestrator/sweeper.py) `sweep_artifacts()`
+  deletes on-disk artifact dirs whose Redis snapshot has expired; wired as Celery-beat task
+  `tasks.sweep_agent_runs` (hourly). Redis keys self-expire via TTL.
+- **Graph viz**: [scripts/viz_graphs.py](backend/scripts/viz_graphs.py) renders both graphs
+  to [docs/agent_graphs/](docs/agent_graphs/) (.mmd + .png).
+Verified: 11-check deferred suite (compaction densify+drop, parallel reads, per-connector
+sem, supervisor, sweeper) + all prior suites green (**145 total**) + clean boot.
+
+**What's left is non-feature work only:**
+- **Turn the flag on + UI migration** (UI_HANDOFF.md is the spec): the Agents page consumes
+  the new events (`question`, `batch_approval_required`, `skill_loaded`, …), the `/resume`
+  (answer/decision/batch) + `/interject` + `/state` + `/events` endpoints.
+- **Refinement** of anything surfaced once the UI is live.
 
 ## 6. Open / deferred items
 - ~~**LangGraph checkpointer + `interrupt`**~~ — **landed in Phase R1 (§5c)** for the action

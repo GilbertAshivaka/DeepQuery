@@ -19,6 +19,7 @@ export default function AgentsPage() {
     turns,
     conversations,
     isStreaming,
+    isStopping,
     isLoadingTurns,
     sendQuery,
     cancelRun,
@@ -27,10 +28,15 @@ export default function AgentsPage() {
     loadConversations,
     deleteConversation,
     resolveApproval,
+    resolveBatch,
+    answerQuestion,
+    interject,
+    reattachLiveRun,
     activeConversationId,
   } = useAgentStore();
 
   const [input, setInput] = useState('');
+  const [note, setNote] = useState('');
   const [selectedSource, setSelectedSourceRaw] = useState(null);
   const [showHistory, setShowHistory] = useState(false);
   const [attachments, setAttachments] = useState([]); // {key, filename, kind, id, status}
@@ -47,12 +53,29 @@ export default function AgentsPage() {
   }, [loadConversations]);
 
   useEffect(() => {
-    if (conversationId) {
-      setActiveConversation(conversationId);
-    } else {
-      startNewConversation();
-    }
-  }, [conversationId, setActiveConversation, startNewConversation]);
+    let cancelled = false;
+    (async () => {
+      if (conversationId) {
+        await setActiveConversation(conversationId);
+      } else {
+        startNewConversation();
+      }
+      // After (re)load, reattach to an in-flight run for this conversation if one exists.
+      if (!cancelled) reattachLiveRun();
+    })();
+    return () => { cancelled = true; };
+  }, [conversationId, setActiveConversation, startNewConversation, reattachLiveRun]);
+
+  // Refocus / tab-visible: re-check for a live run to reattach (e.g. after sleeping).
+  useEffect(() => {
+    const onFocus = () => reattachLiveRun();
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onFocus);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onFocus);
+    };
+  }, [reattachLiveRun]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -108,6 +131,17 @@ export default function AgentsPage() {
       e.preventDefault();
       handleSubmit(e);
     }
+  };
+
+  // Steer a running controller run without stopping it (interjection, §3b).
+  const lastTurn = turns[turns.length - 1];
+  const canSteer = isStreaming && lastTurn?.role === 'assistant' && !!lastTurn.threadId;
+  const sendNote = (e) => {
+    e?.preventDefault();
+    const text = note.trim();
+    if (!text || !canSteer) return;
+    interject(text, 'augment');
+    setNote('');
   };
 
   const handleNew = () => {
@@ -213,6 +247,8 @@ export default function AgentsPage() {
                     onDocumentClick={setSelectedSource}
                     onAttachmentClick={handleAttachmentClick}
                     onResolveApproval={resolveApproval}
+                    onResolveBatch={resolveBatch}
+                    onAnswerQuestion={answerQuestion}
                   />
                 ))}
                 <div ref={bottomRef} />
@@ -223,6 +259,28 @@ export default function AgentsPage() {
 
         {/* Input */}
         <div className="px-4 md:px-8 py-4 pb-5">
+          {/* Mid-flight steering: add a note to a running run without stopping it. */}
+          {canSteer && (
+            <form onSubmit={sendNote} className="max-w-3xl mx-auto mb-2">
+              <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-violet-500/[0.04] border border-violet-500/20">
+                <Sparkles size={13} className="text-violet-500 flex-shrink-0" />
+                <input
+                  value={note}
+                  onChange={(e) => setNote(e.target.value)}
+                  placeholder="Add a note to steer the agent — e.g. “also check the 2024 figures”…"
+                  className="flex-1 bg-transparent text-xs text-ink-800 placeholder:text-cream-400 focus:outline-none"
+                />
+                <button
+                  type="submit"
+                  disabled={!note.trim()}
+                  className="text-[11px] font-medium text-violet-700 hover:text-violet-800 disabled:opacity-30 transition-colors"
+                >
+                  Send
+                </button>
+              </div>
+            </form>
+          )}
+
           <form onSubmit={handleSubmit} className="max-w-3xl mx-auto">
             {/* Pending attachment chips (detach with × before sending) */}
             {attachments.length > 0 && (
@@ -293,10 +351,11 @@ export default function AgentsPage() {
                 <button
                   type="button"
                   onClick={cancelRun}
-                  className="flex-shrink-0 p-2.5 rounded-xl bg-terra-500/10 text-terra-500 hover:bg-terra-500/20 transition-all"
-                  title="Stop"
+                  disabled={isStopping}
+                  className="flex-shrink-0 p-2.5 rounded-xl bg-terra-500/10 text-terra-500 hover:bg-terra-500/20 disabled:opacity-50 transition-all"
+                  title={isStopping ? 'Wrapping up…' : 'Stop'}
                 >
-                  <StopCircle size={18} />
+                  {isStopping ? <Loader2 size={18} className="animate-spin" /> : <StopCircle size={18} />}
                 </button>
               ) : (
                 <button

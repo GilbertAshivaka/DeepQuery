@@ -34,6 +34,68 @@ Backend layers and what they give the UI:
 Models: the agent layer runs on **`openai/gpt-oss-120b` via Groq** (all slots);
 chat still uses Groq/Llama. (Configurable per deployment.)
 
+> **Update (2026-06-14): the resumable controller agent (RESUMABLE_AGENT_SPEC_V2, R1–R8 +
+> all optimizations) is built and tested behind `agent_controller_loop` (default OFF).**
+> The Agents page already works against the *fixed* pipeline. The next initiative is **§1a:
+> migrating the Agents UI to the controller contract** below, then turning the flag on. See
+> `AGENT_LAYER_PLAN.md` §5c/§5d for the backend build status.
+
+---
+
+## 1a. UI migration to the controller agent (DO THIS NEXT)
+
+The backend kept BOTH the old and new flows alive, so **nothing breaks today** and this is a
+deliberate migration, not a fire. Current frontend: [agentService.js](frontend/src/services/agentService.js),
+[agentStore.js](frontend/src/store/agentStore.js), [AgentMessage.jsx](frontend/src/components/agents/AgentMessage.jsx)
+(inline `ApprovalGate`). The new contract is fully specified in §3 / §3a / §3b / §8 below.
+
+**Why nothing breaks now:** `POST /run` still returns SSE; the new `id:`/`: ping` lines are
+ignored by the current reader; `run_started` hits the store's `default` case. Action runs
+still pause at `approval_required` and the current code resolves them via the legacy
+`/actions/{id}/approve|reject` JSON endpoints, which still work. The catch: in durable mode
+the legacy approve executes the action *outside* the checkpointed run, leaving it parked
+(TTL-swept) and giving none of the resumable payoff — so the migration is what unlocks value.
+
+**The migration discriminator (no feature flag needed — both backends coexist):**
+> If `approval_required` carries a **`thread_id`** → resume via `POST /threads/{id}/resume`.
+> If it does **not** (the non-durable fallback) → use the legacy `/actions/{id}/approve|reject`.
+> This is exact: durable runs always include `thread_id`; the fallback never does.
+
+### Tier 1 — adopt the resumable continuation (REQUIRED; unlocks R1–R8)
+- [agentService.js](frontend/src/services/agentService.js): add `resumeThread(threadId, body, onEvent, onDone, onError)`
+  — a fetch+stream-reader SSE call to `/threads/{id}/resume` (same pattern as `runAgent`), where
+  `body` is `{decision}` (single gate), `{batch_decisions:{pending_id:…}}` (batch), or `{answer}`
+  (question). Add `interjectThread(threadId, message, mode)` (JSON `POST /threads/{id}/interject`).
+- [agentStore.js](frontend/src/store/agentStore.js):
+  1. **Capture `thread_id`** from `run_started` (and `approval_required`/`question`) onto the turn.
+  2. **Rewrite `resolveApproval`** from the one-shot JSON call into a *streaming* `/resume`:
+     set `isStreaming` true, feed the continuation (`step_status`→`reasoning`→`answer_token`→
+     `action_result`→`done`) into the turn. The report now streams instead of arriving as one blob.
+  3. **Handle the new events**: `action_result` (sets approval status executed/rejected/failed/
+     **blocked**), `batch_approval_required` (render a per-action toggle modal; resume with
+     `batch_decisions`), `question` (inline answer input; resume with `{answer}`), `skill_loaded`
+     (quiet "following your *X* playbook" chip), and `approval_required{regated:true}` mid-resume.
+  4. **Branch on the discriminator** above so single-action runs work in both durable & fallback.
+- [AgentMessage.jsx](frontend/src/components/agents/AgentMessage.jsx): `ApprovalGate` mostly
+  unchanged (still calls `onResolve(pending_id, decision)`); the store does the new work. Add a
+  batch-approval card (per-action checkboxes) + an inline question input.
+
+### Tier 2 — reload/reconnect durability (HIGH-VALUE; the R2/R3 payoff)
+Today a reload mid-run loses the live run (the assistant turn isn't in the DB until completion).
+With the executor (R3) the run keeps going server-side, so the UI can reattach:
+- Persist the in-flight `thread_id` (e.g. localStorage). On load/refocus, `GET /threads/{id}/state`
+  to repaint (snapshot: plan/trace/answer/citations/pending_approval/pending_question/run_status/
+  `last_event_id`), then open `GET /threads/{id}/events?last_event_id=…` (or `Last-Event-ID` header
+  via `EventSource`) to resume the live feed. `run_status:"interrupted"` = the run died in a restart.
+- Add a small "add a note…" input (→ `interjectThread`, mode `augment`) and wire **Stop** to
+  `cancel_run` (§3b).
+
+### Then
+Flip `agent_controller_loop=true` in a dev deployment, watch real runs via the decision logs +
+token estimates, and **retire** the legacy `/actions/{id}/approve|reject` endpoints + the
+`_post_action_continuation` shim once `/resume` is proven. Quality to watch (untested vs real
+traffic): compaction summary fidelity, whether the model uses parallel `queries` well, gate UX.
+
 ---
 
 ## 2. Two distinct surfaces: Chat vs Agents (left-sidebar tools)
@@ -70,12 +132,16 @@ Request body:
 ```json
 { "query": "string",
   "conversation_id": "optional — omit to start a new conversation",
-  "attachment_ids": ["optional ids from /attachments upload"] }
+  "attachment_ids": ["optional ids from /attachments upload"],
+  "skill_names": ["optional — playbooks to apply to this run (controller, R8)"] }
 ```
+(`skill_names` is the explicit "use this assistant/playbook" path; the controller may also
+discover + load others itself. List active skills via `/api/skills/*`.)
 Each SSE frame is `data: {json}\n\n`. Event types and shapes (render each):
 
 | `type` | payload | UI treatment |
 |---|---|---|
+| `run_started` | `{thread_id, conversation_id}` | **first event of every run (R2).** Capture `thread_id` immediately — it's the handle for reconnect (`/threads/{id}/events`), the one-GET paint (`/threads/{id}/state`), and resume. |
 | `plan` | `{steps:[{id,label,status}]}` | the **todo checklist** (Claude-Code style). statuses: `pending`/`running`/`done`/`awaiting-approval`. Plans differ by intent (doc: search→generate→verify; action: gather→propose→await approval; direct: single "answer" step). |
 | `step_status` | `{id, status}` | update one checklist step's state |
 | `thinking` | `{content}` | **streamed model chain-of-thought deltas** (gpt-oss reasoning channel) — the **Anthropic-style collapsible thinking block**. Append deltas as they arrive; distinct from the answer. |
@@ -83,18 +149,58 @@ Each SSE frame is `data: {json}\n\n`. Event types and shapes (render each):
 | `tool_activity` | `{tool, detail, status}` | quiet activity line ("document_search · 5 passages", "deepwiki:read_wiki_contents · 1 live record", "document_expand · loaded full text of X"). |
 | `citations` | `{citations:[…]}` | the source chips (§7). Emitted once after retrieval; may include all 4 source kinds. |
 | `answer_token` | `{content}` | **append** to the streaming answer (many small deltas — true token streaming). |
-| `approval_required` | `{pending_id, connector, capability, preview, reasoning, sources:[citations]}` | open the **approval-gate modal** (§8). The run stream **ends** after this; resume via the approve/reject endpoints. |
+| `approval_required` | `{thread_id, pending_id, connector, capability, preview, reasoning, summary, sources:[citations], regated?}` | open the **approval-gate modal** (§8). The run **pauses** here; resume on the **same `thread_id`** via `POST /threads/{thread_id}/resume`. `regated:true` = a re-presented preview after the prior one expired during a long pause. |
+| `batch_approval_required` | `{thread_id, batch:[{pending_id, connector, capability, preview, summary, reasoning, preview_status, sources}]}` | **(controller, R6)** a multi-action plan awaiting ONE approval. Render a batch modal with a **per-action toggle** (approve/deselect). `preview_status` ∈ `resolved` (the `preview` is the concrete action) / `parameterized` (its args derive from an earlier action's result — the `preview` shows the template + the approved **bounds**, enforced at run time). The run pauses; resume with `{batch_decisions:{pending_id:"approve"|"reject"}}`. |
+| `action_result` | `{thread_id, pending_id, status, message, error?}` | **(R1/R2) post-resume:** the grounded "here's what I did" report after an approved action executed (`status` ∈ `executed`/`rejected`/`failed`/`blocked`). `message` is also streamed as `answer_token`s. |
+| `question` | `{thread_id, text, context?}` | **(controller, R7)** the agent is blocked and asks the user. Render an inline question/answer input; the run pauses. Resume with `{"answer":"<the user's reply>"}` on `POST /threads/{thread_id}/resume`; the continuation streams normally. |
+| `skill_loaded` | `{name, version}` | **(controller, R8)** the agent loaded a playbook that's governing the run. Render a quiet chip/step ("Following your *quarterly-report* playbook"). |
 | `verification_result` | `{outcome, corrected_answer, explanation}` | outcome ∈ `VERIFIED`/`CORRECTED`/`INSUFFICIENT_CONTEXT`. Show a small verification badge; if `CORRECTED`, the corrected answer is the authoritative one. |
-| `done` | `{conversation_id, answer, intent, citations, verification, proposed_action, grounded}` | terminal. `conversation_id` is the thread to reuse for follow-ups. `grounded:false` = a direct/general-knowledge answer (see §5 — do **not** badge it as "ungrounded"; the user finds that nagging). |
+| `done` | `{conversation_id, thread_id, paused, answer, intent, citations, verification, proposed_action, grounded}` | terminal **for this stream segment**. `paused:true` → the run is parked at the approval gate (a resume will produce a new segment ending in its own `done`). `conversation_id` is the thread to reuse for follow-ups. `grounded:false` = a direct/general-knowledge answer (see §5 — do **not** badge it "ungrounded"). |
 | `error` | `{message}` | show a calm error; the rest of the answer (if any) still stands. |
 
 **Notes for the UI:**
-- A typical doc run emits: `reasoning`→`plan`→`step_status`(retrieve running)→
+- A typical doc run emits: `run_started`→`reasoning`→`plan`→`step_status`(retrieve running)→
   `tool_activity`→`citations`→`step_status`s→`reasoning`→`answer_token`×N→
   `step_status`→`reasoning`→`verification_result`→`step_status`→`done`.
-- An **action** run ends at `approval_required` (no answer tokens) until the human decides.
-- A **direct** run: `reasoning`→`plan`(single step)→`step_status`→`reasoning`→
+- An **action** run emits up to `approval_required` then `done{paused:true}` and **parks**.
+  On `POST /threads/{thread_id}/resume` it produces a **continuation segment** on the same
+  stream: `step_status`(approve)→`reasoning`→`answer_token`×N→`action_result`→`done`.
+- A **direct** run: `run_started`→`reasoning`→`plan`(single step)→`step_status`→`reasoning`→
   `answer_token`×N→`done` (no retrieval/citations/verify).
+
+### 3b. Mid-flight steering — interjection (R7)
+
+While a controller run is going, the user can steer it without stopping it:
+`POST /api/agents/threads/{thread_id}/interject` body `{"message":"…","mode":"augment"|"cancel_step"|"cancel_run"}`.
+The note lands in the run's mailbox and is picked up at the controller's next step boundary:
+`augment` ("also do X") folds into the plan, `cancel_step` ("skip that") drops the current
+direction, `cancel_run` wraps up gracefully. If the run is paused (gate/question), the note
+is read when it resumes. Returns JSON `{queued, mode}` (not SSE) — the effect shows up on
+the run's event stream. A natural UI: a small input under a running run ("add a note…") and
+a Stop button wired to `cancel_run`.
+
+### 3a. Durability, reconnect & one-GET paint (R2)
+
+Every run is mirrored to a per-run Redis stream + snapshot, so the UI survives reloads,
+disconnects, and multi-tab — and can come back tomorrow to an awaiting-approval run. All
+keyed by the `thread_id` from `run_started`.
+
+- `GET /api/agents/threads/{thread_id}/state` → the **snapshot** for a one-GET paint:
+  `{thread_id, run_status, plan, trace, answer, citations, verification, pending_approval,
+  pending_question, action_result, intent, grounded, last_event_id}`. `run_status` ∈
+  `running`/`awaiting_approval`/`awaiting_input`/`done`/`error` (`awaiting_input` = a pending
+  question). Paint from this on (re)load, then subscribe from `last_event_id`.
+- `GET /api/agents/threads/{thread_id}/events` → **SSE subscriber** with the *same* event
+  shapes as `/run`. Send `Last-Event-ID` (header — `EventSource` does this automatically on
+  reconnect — or `?last_event_id=`) to **replay** what you missed, then it **tails live**.
+  Frames carry an SSE `id:` so the browser tracks the cursor for you. The stream ends when
+  the run completes, errors, or pauses for approval.
+- Recommended UI flow: drive a new turn on `POST /run` as today. On any interruption
+  (reload, network drop), `GET /state` to repaint, then open `/events` to resume the live
+  feed. `POST /resume` continues on the same `thread_id`; reconnect via `/events` to watch it.
+- **No-Redis fallback:** if the run-state store is briefly down, `/run` still streams
+  directly (unaffected) but `/state` and `/events` return `404/503` — treat as "reconnect
+  unavailable," not a failed run.
 
 ---
 
@@ -206,19 +312,36 @@ The "Sources" section should group by kind (Documents / Full documents / Live / 
 
 ## 8. Approval-gate modal (the highest-stakes surface — UI guide §6 still applies)
 
-When an agent proposes an action, the run stream emits **`approval_required`** and ends.
-Render the modal (UI guide §6 visual spec holds):
+When an agent proposes an action, the run stream emits **`approval_required`** then
+`done{paused:true}` and parks. Render the modal (UI guide §6 visual spec holds):
 - **What** — `preview` (verbatim, the literal action/payload, boxed and prominent).
 - **Why** — `reasoning`.
 - **On what basis** — `sources` (citation objects; render with the §7 chips).
 - **Controls** — Approve (rust primary) / Reject (neutral), one action per modal,
   never auto-confirm.
 
-Resolve via (these return JSON, not SSE):
-- `POST /api/agents/actions/{pending_id}/approve` → `{type:"action_result", status:"executed"|"failed", result|error}`.
-- `POST /api/agents/actions/{pending_id}/reject` → `{type:"action_result", status:"rejected"}`.
+**Resolve via the resume endpoint (preferred — durable runs), which returns SSE:**
+- `POST /api/agents/threads/{thread_id}/resume` with body `{"decision":"approve"|"reject"}`
+  (the `thread_id` from `approval_required`/`run_started`). The response **streams the
+  continuation** (`step_status`→`reasoning`→`answer_token`×N→`action_result`→`done`), so the
+  agent **reports back what it did** in the same conversation — not a dead end. On approve it
+  executes once (backend mints the single-use token + executes); on a long pause where the
+  preview expired, the stream re-emits `approval_required{regated:true}` — re-present the modal.
 
-Approve = it executes once (the backend mints the single-use token + executes).
+> Legacy JSON endpoints (`POST /actions/{pending_id}/approve|reject` → a single
+> `action_result` JSON) still exist for the non-durable fallback; prefer `resume` so the UI
+> gets the streamed report and reconnect story. Both mint the token server-side.
+
+**Batch approval (controller, R6):** when the run emits `batch_approval_required`, render a
+modal listing every action with a per-action approve/deselect toggle, then resume once with
+`POST /threads/{thread_id}/resume` body `{"batch_decisions": {"<pending_id>": "approve"|"reject", …}}`.
+The continuation streams a per-action `action_result` for each, plus a combined report as
+`answer_token`s, then `done`. Approved **resolved** actions execute; **parameterized** ones
+are materialized from prior results and the gateway enforces the approved bounds before
+running — if the real values fall outside, that action comes back `action_result.status:"blocked"`
+(NOT executed) and the report flags it as held back for a fresh approval. Deselected actions
+are skipped.
+
 States to show: pending → approving → executed / rejected / failed.
 
 ---
