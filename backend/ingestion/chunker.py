@@ -48,6 +48,18 @@ class DocumentChunk:
     ocr_usable: bool = False
     metadata: dict = field(default_factory=dict)
 
+    @property
+    def text_for_index(self) -> str:
+        """The textual representation used by text-consuming downstream stages
+        (Chroma document field / Skill Sync, entity extraction, metadata): native
+        extracted text, else usable OCR text for scanned pages. NEVER used for
+        embedding — scanned pages are still embedded as images (the image vector is
+        the deliberate multimodal choice); this only feeds text consumers."""
+        native = (self.text or "").strip()
+        if native:
+            return native
+        return self.ocr_text if self.ocr_usable else ""
+
 
 class SemanticChunker:
     """Split extracted blocks into semantic chunks for embedding."""

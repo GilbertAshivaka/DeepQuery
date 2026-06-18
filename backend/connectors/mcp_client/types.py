@@ -58,6 +58,11 @@ class Discovery:
     tools: list["DiscoveredTool"] = field(default_factory=list)
     resources: list["DiscoveredResource"] = field(default_factory=list)
     prompts: list["DiscoveredPrompt"] = field(default_factory=list)
+    # Self-reported server identity (MCP serverInfo): a display title, the icon the server
+    # declares for itself, and its website. All optional — most servers declare none.
+    server_title: Optional[str] = None
+    server_icon: Optional[str] = None
+    website_url: Optional[str] = None
 
 
 @dataclass

@@ -79,6 +79,38 @@ class Settings(BaseSettings):
     # every UNKNOWN tool is excluded entirely (not read, not proposed).
     agent_live_strict_read_filter: bool = False
 
+    # Connector pre-selection: before opening ANY connection, let the model pick which
+    # enabled connectors are worth consulting from their control-plane catalog (name +
+    # summary, no network I/O), and discover only those. Without this, a query fans out
+    # discovery to every enabled connector and pays each dead server's full timeout. Off
+    # falls back to the old "discover everything" behaviour.
+    agent_connector_preselect: bool = True
+    # Most connectors to discover after pre-selection (bounds the live blast radius).
+    agent_connector_preselect_max: int = 4
+    # When more connectors are enabled than this, the selection prompt can't show the full
+    # list. Above the limit we switch to the semantic resolve path (the model names what it
+    # needs, we look it up); at or below it, the model picks from the shown list directly.
+    agent_connector_prefilter_limit: int = 40
+    # Scale path: above the limit, let the model emit intent phrases (without seeing the
+    # list) and resolve them semantically against the connector catalog. Off falls back to
+    # lexical narrowing + the shown-list pick (no embeddings needed).
+    agent_connector_semantic_resolve: bool = True
+    # Minimum cosine similarity for a connector to be considered a semantic match.
+    agent_connector_resolve_min_score: float = 0.55
+    # Persist connector embeddings in a Chroma collection so they survive restarts (a
+    # connector is only re-embedded when its name/summary changes). Off keeps the index
+    # purely in-process (re-embedded on each restart). Best-effort: if Chroma is
+    # unreachable, the resolver still works from the in-process cache.
+    agent_connector_index_persist: bool = True
+    # When a connector declares no icon of its own (MCP serverInfo.icons), fall back to a
+    # favicon for the connector's domain. Uses a third-party favicon proxy, so it's
+    # disabled automatically in air-gapped mode. Set False to never call out for icons.
+    connector_favicon_fallback: bool = True
+    # How long (seconds) to skip re-discovering a connector whose discovery just failed
+    # (server down / timeout). A failing connector must not make every query pay its
+    # timeout again; 0 disables the negative cache (the circuit breaker still applies).
+    agent_discovery_failure_ttl_seconds: int = 60
+
     # ── ChromaDB ─────────────────────────────────────────────
     chroma_persist_directory: str = "./chroma_data"
     chroma_host: str = "localhost"
@@ -148,6 +180,32 @@ class Settings(BaseSettings):
     # checkpoints (a paused approval older than this requires a fresh run).
     agent_run_ttl_hours: int = 72
 
+    # ── Document generation sandbox (DOCUMENT_GENERATION_SANDBOX_GUIDE) ──
+    # The `produce` action: the controller asks an LLM to write a self-contained
+    # Python script and runs it in a locked-down container, returning the document.
+    # Off by default — opt-in like the controller loop; requires the prebaked image
+    # (backend/sandbox/) and a container runtime on the host.
+    agent_produce_enabled: bool = False
+    # Container runtime binary ("docker" | "podman"). run_sandbox shells out to it
+    # with the security flags proven in backend/sandbox/README.md. Runtime-agnostic
+    # so the deploy shape (Docker Desktop / rootless Podman) stays a config choice.
+    agent_sandbox_runtime: str = "docker"
+    # Prebaked toolchain image (built from backend/sandbox/Dockerfile). Pinned tag;
+    # recorded in telemetry. Bump deliberately when the dep set changes.
+    agent_sandbox_image: str = "deepquery-doctools:0.1"
+    # Hard per-run resource limits (the blast-radius caps from §3.2).
+    agent_sandbox_timeout_s: int = 120
+    agent_sandbox_memory: str = "1g"
+    agent_sandbox_cpus: str = "1"
+    agent_sandbox_pids_limit: int = 128
+    # Global concurrency gate: queued produce steps wait for a build slot.
+    agent_sandbox_max_concurrent: int = 2
+    # Output size cap (per produced file) enforced at validation, in addition to the
+    # container's tmpfs limit.
+    agent_sandbox_output_max_mb: int = 25
+    # Repair loop (§5): max script-generation attempts before graceful degradation.
+    agent_produce_max_attempts: int = 3
+
     # ── Connector Infrastructure ─────────────────────────────
     # Fernet key for encrypting per-user connector credentials at rest. Generate
     # with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
@@ -176,6 +234,11 @@ class Settings(BaseSettings):
     # ── Chunking ─────────────────────────────────────────────
     chunk_size_tokens: int = 500
     chunk_overlap_tokens: int = 65
+
+    # ── OCR (scanned pages → BM25 + downstream text) ─────────
+    # Path to the Tesseract binary. Leave empty to use PATH; otherwise the OCR
+    # module also probes common install locations as a fallback.
+    tesseract_cmd: str = ""
 
 
 settings = Settings()

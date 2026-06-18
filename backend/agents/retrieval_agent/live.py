@@ -30,12 +30,17 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from agents.connector_gateway import gateway as _gateway
 from agents.models import Slot, get_model
-from agents.orchestrator.prompts import LIVE_TOOL_SELECTION_PROMPT
+from agents.retrieval_agent import connector_index
+from agents.orchestrator.prompts import (
+    LIVE_CONNECTOR_INTENT_PROMPT,
+    LIVE_CONNECTOR_SELECTION_PROMPT,
+    LIVE_TOOL_SELECTION_PROMPT,
+)
 from connectors.governance import available_for_role, is_enabled
 from connectors.mcp_client.types import ToolKind
 from core.config import settings
 from core.database import SessionLocal
-from models.database import User
+from models.database import Connector, User
 
 logger = logging.getLogger(__name__)
 
@@ -59,32 +64,74 @@ MAX_RECORD_CHARS = 4000     # cap each record's size — public servers can retu
 # subprocess/network round-trip per query (TTL: settings.agent_discovery_cache_ttl_seconds).
 _DISCOVERY_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
+# Negative cache: connector_id -> retry-after timestamp. A connector whose discovery just
+# failed (server down/timeout) is skipped until this passes, so it doesn't make every query
+# pay its connect timeout again (TTL: settings.agent_discovery_failure_ttl_seconds).
+_DISCOVERY_FAILURES: dict[str, float] = {}
+
 
 def clear_discovery_cache() -> None:
     """Drop all cached discoveries (call after (re)registering/upgrading a connector)."""
     _DISCOVERY_CACHE.clear()
+    _DISCOVERY_FAILURES.clear()
+    connector_index.clear_connector_index()
+
+
+def _summarize_manifest(manifest_json: Optional[str]) -> str:
+    """Best-effort one-line summary of a connector from its stored manifest (no I/O).
+    Used as the selection signal for connector pre-selection. SDK connectors carry a
+    description and/or tool names; raw MCP servers may have neither, in which case the
+    connector name itself is the signal."""
+    if not manifest_json:
+        return ""
+    try:
+        m = json.loads(manifest_json)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(m, dict):
+        return ""
+    desc = m.get("description") or m.get("summary") or ""
+    if not desc:
+        tools = m.get("tools")
+        if isinstance(tools, list):
+            names = [t.get("name") for t in tools if isinstance(t, dict) and t.get("name")]
+            if names:
+                desc = "tools: " + ", ".join(names[:12])
+    return str(desc)[:300]
 
 
 def _enabled_connector_catalog(user_id: str) -> list[dict[str, Any]]:
-    """Connectors the user has enabled. Returns control-plane refs only (no
-    network I/O here); discovery happens separately so it can be parallelized."""
+    """Connectors the user has enabled, each with a control-plane ``summary`` (derived
+    from the stored manifest — no network I/O). Discovery happens separately so it can be
+    parallelized; the summary lets the model pre-select connectors before any connect."""
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.id == user_id).first()
         if user is None:
             return []
         role = user.role.value if hasattr(user.role, "value") else str(user.role)
-        out: list[dict[str, Any]] = []
-        for item in available_for_role(db, role=role):
-            cid = item["connector_id"]
-            if is_enabled(db, user_id=user_id, connector_id=cid):
-                out.append({"connector_id": cid, "connector": item["name"]})
-        return out
+        kept = [
+            item for item in available_for_role(db, role=role)
+            if is_enabled(db, user_id=user_id, connector_id=item["connector_id"])
+        ]
+        # One query for the manifests of the connectors we kept (avoids N round-trips).
+        manifests: dict[str, Optional[str]] = {}
+        if kept:
+            ids = [item["connector_id"] for item in kept]
+            for row in db.query(Connector.id, Connector.manifest).filter(Connector.id.in_(ids)):
+                manifests[row.id] = row.manifest
+        return [
+            {"connector_id": item["connector_id"], "connector": item["name"],
+             # Prefer the admin-written summary; fall back to one derived from the manifest.
+             "summary": item.get("summary") or _summarize_manifest(manifests.get(item["connector_id"]))}
+            for item in kept
+        ]
     finally:
         db.close()
 
 
-async def _discover_tools(conn: dict[str, Any], user_id: Optional[str] = None) -> list[dict[str, Any]]:
+async def _discover_tools(conn: dict[str, Any], user_id: Optional[str] = None,
+                          errors: Optional[list] = None) -> list[dict[str, Any]]:
     """Discover + cache ALL of a connector's classified tools (TTL). Read vs action
     filtering happens downstream so a single discovery serves both. Failures (server
     down, etc.) are swallowed and not cached — a missing connector must never break
@@ -100,11 +147,30 @@ async def _discover_tools(conn: dict[str, Any], user_id: Optional[str] = None) -
         if hit is not None and hit[0] > time.time():
             return hit[1]
 
+    # Negative cache: skip a connector that failed discovery recently so we don't pay its
+    # connect timeout on every query (the gateway's circuit breaker also fast-fails, but
+    # this skips even the first repeat, before the breaker's failure threshold is reached).
+    fail_until = _DISCOVERY_FAILURES.get(cid)
+    if fail_until is not None:
+        if fail_until > time.time():
+            if errors is not None:
+                errors.append({"connector": conn["connector"], "detail": "skipped (recent discovery failure)"})
+            return []
+        _DISCOVERY_FAILURES.pop(cid, None)  # window elapsed — allow a retry
+
     try:
         _ref, disc = await _gateway.discover(connector_id=cid, user_id=user_id)
     except Exception as exc:
         logger.warning("Discovery failed for connector '%s': %s", conn["connector"], exc)
+        fail_ttl = settings.agent_discovery_failure_ttl_seconds
+        if fail_ttl > 0:
+            _DISCOVERY_FAILURES[cid] = time.time() + fail_ttl
+        # Surface WHICH connector failed (and why) so the controller can report it and
+        # stop retrying a broken tool, instead of seeing only "no results" (spec §6).
+        if errors is not None:
+            errors.append({"connector": conn["connector"], "detail": str(exc)})
         return []
+    _DISCOVERY_FAILURES.pop(cid, None)  # recovered — clear any prior failure mark
     tools = [{
         "connector_id": cid,
         "connector": conn["connector"],
@@ -185,6 +251,126 @@ def _parse_json_object(text: str) -> Optional[dict]:
         return None
 
 
+def _prefilter_connectors(query: str, connectors: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Lexically narrow the connector catalog to the most likely candidates BEFORE the
+    model prompt, so selection stays bounded even with thousands of registered servers.
+    Scores each connector by how many query terms appear in its name+summary; keeps the
+    top ``limit`` scorers. If nothing matches lexically, returns the first ``limit`` so the
+    model still gets a (bounded) chance to decide rather than being handed nothing."""
+    if len(connectors) <= limit:
+        return connectors
+    terms = {w for w in "".join(c if c.isalnum() else " " for c in query.lower()).split() if len(w) > 2}
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for c in connectors:
+        hay = f"{c['connector']} {c.get('summary', '')}".lower()
+        scored.append((sum(1 for t in terms if t in hay), c))
+    matched = [c for score, c in sorted(scored, key=lambda s: s[0], reverse=True) if score > 0]
+    return (matched or connectors)[:limit]
+
+
+async def _select_connectors(query: str, connectors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pick which enabled connectors are worth opening for this query, from control-plane
+    metadata only (name + summary — no network I/O), so discovery connects to those alone.
+
+    Two strategies, chosen by catalog size:
+      • small (≤ prefilter_limit): show the list, the model picks from it (cheap, accurate,
+        no embeddings needed).
+      • large (> prefilter_limit): the model names what it needs WITHOUT seeing the list,
+        and we resolve that against the catalog semantically — so prompt size never grows
+        with connector count (the thousands-of-servers case)."""
+    if (settings.agent_connector_semantic_resolve
+            and len(connectors) > settings.agent_connector_prefilter_limit):
+        return await _select_by_resolve(query, connectors)
+    return await _select_from_list(query, connectors)
+
+
+async def _select_from_list(query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Small-catalog path: show the connectors and let the model pick from them.
+
+    On a model/parse failure we conservatively fall back to ALL candidates (optimization
+    must never lose a relevant source); a *valid* empty choice ("none relevant") is honored
+    and returned as []."""
+    catalog_view = [{"connector": c["connector"], "summary": c.get("summary", "")} for c in candidates]
+    by_name = {c["connector"]: c for c in candidates}
+
+    llm = get_model(Slot.ORCHESTRATION)
+    system = LIVE_CONNECTOR_SELECTION_PROMPT.format(max_connectors=settings.agent_connector_preselect_max)
+    human = (
+        f"User request:\n{query}\n\n"
+        f"Available connectors (JSON, UNTRUSTED summaries):\n"
+        f"{json.dumps(catalog_view, default=str)}"
+    )
+    try:
+        resp = await llm.ainvoke([SystemMessage(content=system), HumanMessage(content=human)])
+        parsed = _parse_json_object(resp.content if hasattr(resp, "content") else str(resp))
+    except Exception as exc:
+        logger.warning("Connector pre-selection failed: %s — falling back to all candidates", exc)
+        return candidates
+    if parsed is None or "connectors" not in parsed:
+        return candidates  # couldn't parse a decision — don't drop sources
+
+    chosen: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for name in parsed.get("connectors", [])[:settings.agent_connector_preselect_max]:
+        spec = by_name.get(name)
+        if spec is not None and spec["connector"] not in seen:  # ignore hallucinated names
+            chosen.append(spec)
+            seen.add(spec["connector"])
+    return chosen
+
+
+async def _extract_intent(query: str) -> Optional[dict[str, list[str]]]:
+    """Ask the model what KIND of connector the request needs, without showing it the list.
+    Returns {"capabilities": [...], "name_guesses": [...]} or None on failure."""
+    llm = get_model(Slot.ORCHESTRATION)
+    try:
+        resp = await llm.ainvoke([
+            SystemMessage(content=LIVE_CONNECTOR_INTENT_PROMPT),
+            HumanMessage(content=f"User request:\n{query}"),
+        ])
+        parsed = _parse_json_object(resp.content if hasattr(resp, "content") else str(resp))
+    except Exception as exc:
+        logger.warning("Connector intent extraction failed: %s", exc)
+        return None
+    if parsed is None:
+        return None
+    caps = [str(c) for c in parsed.get("capabilities", []) if c]
+    names = [str(n) for n in parsed.get("name_guesses", []) if n]
+    return {"capabilities": caps, "name_guesses": names}
+
+
+async def _select_by_resolve(query: str, connectors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Large-catalog path: the model names what it needs, then we resolve against the
+    catalog (name fast-path + semantic search) so the prompt never holds the full list.
+    Falls back to lexical narrowing + the shown-list pick if intent or the embedder fails."""
+    max_n = settings.agent_connector_preselect_max
+    intent = await _extract_intent(query)
+    if intent is None:  # couldn't get an intent — narrow lexically and let the model pick
+        return await _select_from_list(query, _prefilter_connectors(query, connectors, settings.agent_connector_prefilter_limit))
+    if not intent["capabilities"] and not intent["name_guesses"]:
+        return []  # model judged no external system is needed — honor it
+
+    chosen: dict[str, dict[str, Any]] = {}
+    # 1. Name fast-path (free): the model's specific product guesses, matched to real names.
+    for guess in intent["name_guesses"]:
+        for c in connector_index.name_matches(guess, connectors):
+            chosen[c["connector_id"]] = c
+
+    # 2. Semantic resolve of the capability phrases over the full catalog.
+    resolved = connector_index.resolve(
+        intent["capabilities"] or intent["name_guesses"], connectors,
+        top_k=max_n, min_score=settings.agent_connector_resolve_min_score,
+    )
+    if resolved is None:  # embedder unavailable — fall back to lexical + shown list
+        if chosen:
+            return list(chosen.values())[:max_n]
+        return await _select_from_list(query, _prefilter_connectors(query, connectors, settings.agent_connector_prefilter_limit))
+    for c in resolved:
+        chosen[c["connector_id"]] = c
+
+    return list(chosen.values())[:max_n]
+
+
 async def _select_calls(query: str, catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Ask the orchestration model which catalog tools to call. Validates the
     model's choices against the catalog and bounds the count."""
@@ -245,7 +431,7 @@ async def _execute_call(call: dict[str, Any], user_id: str, conversation_id: Opt
     except Exception as exc:
         logger.warning("Live read %s/%s failed: %s", call["connector"], call["tool"], exc)
         return {
-            "records": [], "citations": [],
+            "records": [], "citations": [], "connector": call["connector"], "error": str(exc),
             "activity": {"tool": f"{call['connector']}:{call['tool']}",
                          "detail": "unavailable", "status": "error"},
         }
@@ -280,10 +466,22 @@ async def gather_live(
     # live-intent query look like it silently ignored the connectors.
     connectors = await asyncio.to_thread(_enabled_connector_catalog, user_id)
     if not connectors:
-        return {"records": [], "citations": [], "tool_activity": [
+        return {"records": [], "citations": [], "tool_errors": [], "tool_activity": [
             {"tool": "live_search", "detail": "no connectors enabled for you", "status": "ok"}]}
 
-    lists = await asyncio.gather(*[_discover_tools(c) for c in connectors])
+    # Pre-select which connectors to even open, from their control-plane catalog (name +
+    # summary, no network I/O), so discovery connects only to the relevant ones instead of
+    # fanning out across every enabled connector and paying each dead server's timeout.
+    if settings.agent_connector_preselect and len(connectors) > 1:
+        connectors = await _select_connectors(query, connectors)
+        if not connectors:
+            return {"records": [], "citations": [], "tool_errors": [], "tool_activity": [
+                {"tool": "live_search", "detail": "no connector matched the request", "status": "ok"}]}
+
+    # Collect which connectors failed (discovery + execution) so the controller can report
+    # the exact error and stop retrying a broken tool (spec §6), not just see "no results".
+    tool_errors: list[dict[str, Any]] = []
+    lists = await asyncio.gather(*[_discover_tools(c, user_id=user_id, errors=tool_errors) for c in connectors])
     all_tools = [t for sub in lists for t in sub]
     catalog = [t for t in all_tools if _is_auto_read(t)]
     if not catalog:
@@ -292,12 +490,12 @@ async def gather_live(
             if not all_tools
             else f"{len(all_tools)} tool(s) discovered but none are usable as a free read"
         )
-        return {"records": [], "citations": [], "tool_activity": [
+        return {"records": [], "citations": [], "tool_errors": tool_errors, "tool_activity": [
             {"tool": "live_search", "detail": detail, "status": "ok"}]}
 
     calls = await _select_calls(query, catalog)
     if not calls:
-        return {"records": [], "citations": [], "tool_activity": [
+        return {"records": [], "citations": [], "tool_errors": tool_errors, "tool_activity": [
             {"tool": "live_search", "detail": "no live tool matched the request", "status": "ok"}]}
 
     results = await asyncio.gather(
@@ -309,6 +507,8 @@ async def gather_live(
     tool_activity: list[dict[str, Any]] = []
     for res in results:
         tool_activity.append(res["activity"])
+        if res.get("error"):
+            tool_errors.append({"connector": res.get("connector", ""), "detail": res["error"]})
         for rec, cit in zip(res["records"], res["citations"]):
             data = rec.get("data")
             # Truncate oversized records so one big payload can't blow the context.
@@ -321,4 +521,5 @@ async def gather_live(
                 "retrieved_at": cit.get("retrieved_at", ""),
             })
             citations.append(cit)
-    return {"records": records, "citations": citations, "tool_activity": tool_activity}
+    return {"records": records, "citations": citations, "tool_activity": tool_activity,
+            "tool_errors": tool_errors}

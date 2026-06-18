@@ -209,6 +209,20 @@ export async function getAttachmentBlob(id) {
   return data;
 }
 
+// Download a produced deliverable (or any authed file URL) to disk. Fetches the blob
+// with the auth header (a plain <a href> can't), then triggers a browser save.
+export async function downloadFile(url, filename) {
+  const { data } = await api.get(url, { responseType: 'blob' });
+  const objectUrl = URL.createObjectURL(data);
+  const a = document.createElement('a');
+  a.href = objectUrl;
+  a.download = filename || 'document';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(objectUrl);
+}
+
 // ── Conversation history (separate store from chat) ──────────
 export async function getConversations() {
   const { data } = await api.get('/api/agents/conversations');

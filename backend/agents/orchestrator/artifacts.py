@@ -60,6 +60,30 @@ def put(thread_id: str, step_id: str, artifact_id: str, data: Any) -> str:
         return ""
 
 
+def job_dir(thread_id: str, step_id: str) -> Path:
+    """A produce step's working directory (``{root}/{thread}/{step}/``) with an ``output/``
+    subdir, created. The sandbox writes ``script.py`` here and binds ``output/`` as its only
+    writable mount; produced documents persist here (a TTL-swept persistent volume) and are
+    served by the download endpoint. Distinct from JSON ``put``/``get`` artifacts."""
+    d = _root() / _safe(thread_id) / _safe(step_id)
+    (d / "output").mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def output_file(thread_id: str, step_id: str, filename: str) -> Optional[Path]:
+    """Resolve a produced deliverable by its components, or None if missing. The real
+    (script-chosen) filename is preserved; a containment check blocks path traversal
+    outside the step's output dir, so a crafted download request can't escape."""
+    base = (_root() / _safe(thread_id) / _safe(step_id) / "output").resolve()
+    try:
+        candidate = (base / filename).resolve()
+    except (OSError, ValueError):
+        return None
+    if base != candidate and base not in candidate.parents:
+        return None  # traversal attempt
+    return candidate if candidate.is_file() else None
+
+
 def get(ref: str) -> Optional[Any]:
     """Load an artifact by ref, or None if missing/unreadable."""
     if not ref:

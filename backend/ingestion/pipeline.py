@@ -205,8 +205,10 @@ class IngestionPipeline:
 
             results = []
             for chunk in chunks:
-                if chunk.chunk_type in ("text", "table") and chunk.text.strip():
-                    extraction = groq_client.extract_entities(chunk.text)
+                # Use text_for_index so scanned pages (OCR text) also feed the graph.
+                text = chunk.text_for_index
+                if text.strip():
+                    extraction = groq_client.extract_entities(text)
                     if extraction:
                         extraction["source_chunk_id"] = chunk.chunk_id
                         extraction["document_id"] = document_id
@@ -225,8 +227,10 @@ class IngestionPipeline:
 
             results = []
             for chunk in chunks:
-                if chunk.text.strip():
-                    meta = groq_client.generate_metadata(chunk.text)
+                # Use text_for_index so scanned pages (OCR text) get summary/tags.
+                text = chunk.text_for_index
+                if text.strip():
+                    meta = groq_client.generate_metadata(text)
                     results.append(meta or {})
                 else:
                     results.append({})

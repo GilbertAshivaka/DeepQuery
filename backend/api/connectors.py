@@ -53,6 +53,26 @@ gateway = ConnectorGateway()
 admin_only = RoleRequired([UserRole.ADMIN])
 
 
+def _resolve_icon(ref) -> Optional[str]:
+    """The icon to show for a connector: the one the server declared for itself (captured
+    from MCP serverInfo.icons at discovery), or — for a network connector that declares
+    none — a favicon for its domain. The favicon proxy is skipped in air-gapped mode and
+    when ``connector_favicon_fallback`` is off."""
+    if ref.icon_url:
+        return ref.icon_url
+    if not settings.connector_favicon_fallback:
+        return None
+    from urllib.parse import urlparse
+
+    from connectors.gateway.deployment import is_air_gapped
+
+    if is_air_gapped():
+        return None
+    endpoint = ref.endpoint if isinstance(ref.endpoint, dict) else {}
+    host = urlparse(endpoint.get("url", "")).hostname if endpoint.get("url") else None
+    return f"https://www.google.com/s2/favicons?domain={host}&sz=64" if host else None
+
+
 # ── Schemas ──────────────────────────────────────────────────
 class RegisterConnectorRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
@@ -62,6 +82,10 @@ class RegisterConnectorRequest(BaseModel):
         description="stdio: {command, args, env}; sse/http: {url, headers}",
     )
     version: Optional[str] = None
+    summary: Optional[str] = Field(
+        None, max_length=500,
+        description="One-line description of what this connector provides (drives agent routing + UI).",
+    )
     requires_network: bool = True
     auth_method: str = Field("none", description="none | oauth2 | api_key | basic | mtls")
     # OAuth app config: {authorize_endpoint, token_endpoint, scopes, client_id,
@@ -93,6 +117,8 @@ class ConnectorOut(BaseModel):
     version: Optional[str]
     transport: str
     requires_network: bool
+    summary: Optional[str] = None
+    icon_url: Optional[str] = None
 
 
 class DiscoveredToolOut(BaseModel):
@@ -126,6 +152,9 @@ class DiscoveryOut(BaseModel):
     tools: List[DiscoveredToolOut]
     resources: List[DiscoveredResourceOut]
     prompts: List[DiscoveredPromptOut]
+    server_title: Optional[str] = None
+    server_icon: Optional[str] = None
+    website_url: Optional[str] = None
 
 
 class ReadRequest(BaseModel):
@@ -143,7 +172,8 @@ def list_connectors(
     refs = list_connector_refs(db, enabled_only=False)
     return [
         ConnectorOut(
-            id=r.id, name=r.name, version=r.version, transport=r.transport, requires_network=r.requires_network
+            id=r.id, name=r.name, version=r.version, transport=r.transport,
+            requires_network=r.requires_network, summary=r.summary, icon_url=_resolve_icon(r),
         )
         for r in refs
     ]
@@ -167,14 +197,23 @@ def register(
             transport=body.transport,
             endpoint=body.endpoint,
             version=body.version,
+            summary=body.summary,
             requires_network=body.requires_network,
             auth_method=body.auth_method,
             auth_config=auth_config,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    # A new/changed summary changes the connector's semantic-index text; drop the cached
+    # discovery + index entry so it's re-derived (and re-embedded) on next use.
+    try:
+        from agents.retrieval_agent.live import clear_discovery_cache
+        clear_discovery_cache()
+    except Exception:
+        pass
     return ConnectorOut(
-        id=ref.id, name=ref.name, version=ref.version, transport=ref.transport, requires_network=ref.requires_network
+        id=ref.id, name=ref.name, version=ref.version, transport=ref.transport,
+        requires_network=ref.requires_network, summary=ref.summary, icon_url=_resolve_icon(ref),
     )
 
 
@@ -227,6 +266,9 @@ async def discover(
         connector=d.connector,
         server_label=d.server_label,
         supports=d.supports,
+        server_title=d.server_title,
+        server_icon=d.server_icon,
+        website_url=d.website_url,
         tools=[
             DiscoveredToolOut(
                 name=t.name, description=t.description, kind=t.kind.value,
@@ -513,6 +555,8 @@ class DirectoryItemOut(BaseModel):
     approved: bool
     approved_version: Optional[str]
     allowed_roles: Optional[List[str]]
+    summary: Optional[str] = None
+    icon_url: Optional[str] = None
 
 
 @router.get("/directory", response_model=List[DirectoryItemOut])
@@ -535,6 +579,8 @@ def directory(
                 approved=approval is not None,
                 approved_version=approval.approved_version if approval else None,
                 allowed_roles=_json.loads(approval.allowed_roles) if approval and approval.allowed_roles else None,
+                summary=ref.summary,
+                icon_url=_resolve_icon(ref),
             )
         )
     return items
@@ -576,8 +622,11 @@ def available(
     user's own enablement state."""
     role = user.role.value if hasattr(user.role, "value") else str(user.role)
     items = available_for_role(db, role=role)
+    refs_by_id = {r.id: r for r in list_connector_refs(db, enabled_only=False)}
     for it in items:
         it["enabled"] = is_enabled(db, user_id=user.id, connector_id=it["connector_id"])
+        ref = refs_by_id.get(it["connector_id"])
+        it["icon_url"] = _resolve_icon(ref) if ref else it.get("icon_url")
     return items
 
 

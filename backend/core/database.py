@@ -82,6 +82,8 @@ def init_db():
     # existing tables). Idempotent — only adds a column when it's missing.
     if settings.database_url.startswith("sqlite"):
         _add_column_if_missing("agent_turns", "agent_trace", "TEXT")
+        _add_column_if_missing("connectors", "summary", "TEXT")
+        _add_column_if_missing("connectors", "icon_url", "TEXT")
 
 
 def _add_column_if_missing(table: str, column: str, ddl_type: str):

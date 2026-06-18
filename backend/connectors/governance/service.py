@@ -125,6 +125,8 @@ def available_for_role(db: Session, *, role: str) -> list[dict[str, Any]]:
                     "name": conn.name,
                     "version": conn.version,
                     "auth_method": conn.auth_method,
+                    "summary": conn.summary,
+                    "icon_url": conn.icon_url,
                     "allowed_roles": _allowed_roles(approval),
                 }
             )

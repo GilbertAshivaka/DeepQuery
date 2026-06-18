@@ -108,8 +108,10 @@ class ChromaStore:
 
             ids.append(chunk.chunk_id)
             valid_embeddings.append(emb)
-            # Store the full text for retrieval display
-            documents.append(chunk.text or chunk.caption or "[Image content]")
+            # Store the full text for retrieval display + text-based downstream
+            # stages (Skill Sync reads this). Prefers native text, falls back to
+            # usable OCR text for scanned pages (embedding stays image-native).
+            documents.append(chunk.text_for_index or chunk.caption or "[Image content]")
             metadatas.append(chunk_metadata)
 
         if not ids:

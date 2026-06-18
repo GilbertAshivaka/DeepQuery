@@ -7,6 +7,7 @@ import AgentMessage from '../components/agents/AgentMessage';
 import SourceDrawer from '../components/chat/SourceDrawer';
 import AttachmentViewer from '../components/agents/AttachmentViewer';
 import ImageLightbox from '../components/agents/ImageLightbox';
+import CodePanel from '../components/agents/CodePanel';
 import {
   Send, StopCircle, Plus, Bot, History, MessageSquarePlus, Trash2, Sparkles, Loader2,
   FileText, Image as ImageIcon, X,
@@ -41,12 +42,30 @@ export default function AgentsPage() {
   const [showHistory, setShowHistory] = useState(false);
   const [attachments, setAttachments] = useState([]); // {key, filename, kind, id, status}
   const [viewing, setViewing] = useState(null);        // {id, filename, kind} being viewed
+  const [codeView, setCodeView] = useState(null);      // {code, title, language} in the code panel
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
   const fileInputRef = useRef(null);
+  const historyRef = useRef(null);
 
-  // Source drawer and attachment viewer are mutually exclusive (one side panel).
-  const setSelectedSource = (s) => { setViewing(null); setSelectedSourceRaw(s); };
+  // Close the history dropdown on click/tap outside or Escape.
+  useEffect(() => {
+    if (!showHistory) return;
+    const onPointerDown = (e) => {
+      if (historyRef.current && !historyRef.current.contains(e.target)) setShowHistory(false);
+    };
+    const onKeyDown = (e) => { if (e.key === 'Escape') setShowHistory(false); };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [showHistory]);
+
+  // Only one right-side panel at a time (source drawer / attachment viewer / code panel).
+  const setSelectedSource = (s) => { setViewing(null); setCodeView(null); setSelectedSourceRaw(s); };
+  const openCode = (artifact) => { setSelectedSourceRaw(null); setViewing(null); setCodeView(artifact); };
 
   useEffect(() => {
     loadConversations();
@@ -155,6 +174,7 @@ export default function AgentsPage() {
   // (Citation-only attachments have no id and aren't openable.)
   const handleAttachmentClick = (a) => {
     if (!a?.id) return;
+    setCodeView(null);
     if (a.kind === 'image') setViewing({ ...a });
     else { setSelectedSourceRaw(null); setViewing({ ...a }); }
   };
@@ -176,6 +196,7 @@ export default function AgentsPage() {
             <button onClick={handleNew} className="btn-ghost !py-1.5 !px-2.5 text-xs" title="New agent conversation">
               <MessageSquarePlus size={15} /> New
             </button>
+            <div ref={historyRef}>
             <button
               onClick={() => setShowHistory((v) => !v)}
               className="btn-ghost !py-1.5 !px-2.5 text-xs"
@@ -212,6 +233,7 @@ export default function AgentsPage() {
                 )}
               </div>
             )}
+            </div>
           </div>
         </div>
 
@@ -249,6 +271,12 @@ export default function AgentsPage() {
                     onResolveApproval={resolveApproval}
                     onResolveBatch={resolveBatch}
                     onAnswerQuestion={answerQuestion}
+                    onOpenCode={openCode}
+                    onRetry={() => {
+                      // Re-ask the user message that preceded this interrupted turn.
+                      const prevUser = [...turns.slice(0, idx)].reverse().find((t) => t.role === 'user');
+                      if (prevUser) sendQuery(prevUser.content, prevUser.attachments || []);
+                    }}
                   />
                 ))}
                 <div ref={bottomRef} />
@@ -394,6 +422,13 @@ export default function AgentsPage() {
       <AnimatePresence>
         {viewing && viewing.kind === 'image' && (
           <ImageLightbox attachment={viewing} onClose={() => setViewing(null)} />
+        )}
+      </AnimatePresence>
+
+      {/* Build-script code panel (opened from a script.py pill) */}
+      <AnimatePresence>
+        {codeView && (
+          <CodePanel artifact={codeView} onClose={() => setCodeView(null)} />
         )}
       </AnimatePresence>
     </div>

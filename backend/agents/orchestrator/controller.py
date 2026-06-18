@@ -44,7 +44,7 @@ from core.config import settings
 
 logger = logging.getLogger(__name__)
 
-_DECISION_TYPES = {"read", "act", "answer", "ask", "load_skill", "replan", "done"}
+_DECISION_TYPES = {"read", "act", "produce", "answer", "ask", "load_skill", "replan", "done"}
 
 
 # ── Context the controller reasons over ──────────────────────
@@ -173,6 +173,9 @@ async def hydrate_node(state: _g.AgentState) -> dict:
         except Exception as exc:
             logger.warning("controller: live-availability check failed: %s", exc)
     has_action = has_live and bool(state.get("durable")) and has_capability(Capability.ACTION)
+    # produce (document sandbox) is locally side-effect-free → no durability/gate required;
+    # it just needs the feature enabled and the capability registered.
+    has_produce = settings.agent_produce_enabled and has_capability(Capability.PRODUCE)
 
     # Skills (spec §2.10): the index the controller plans with, + any explicitly-selected
     # playbooks loaded up front as run-level instructions (both entry paths).
@@ -193,9 +196,10 @@ async def hydrate_node(state: _g.AgentState) -> dict:
     return {
         "findings": findings, "loop_count": 0, "answered": False, "plan": [],
         "has_documents": has_documents, "has_live": has_live, "has_action": has_action,
-        "skill_index": skill_index, "loaded_skills": loaded_skills,
+        "has_produce": has_produce,
+        "skill_index": skill_index, "loaded_skills": loaded_skills, "failed_tools": [],
         "context_chunks": [], "live_records": [], "whole_documents": [],
-        "citations": [], "graph_context": "",
+        "citations": [], "graph_context": "", "deliverables": [], "produce_attempts": 0,
     }
 
 
@@ -255,13 +259,21 @@ async def controller_node(state: _g.AgentState) -> dict:
         wrap = "answer" if not state.get("answered") else "done"
         return {**base, "decision": {"type": wrap, "reason": "token budget", "step_label": "Answer with what I have"}}
 
+    failed = state.get("failed_tools") or []
+    failed_block = ""
+    if failed:
+        failed_block = ("Tools that have already FAILED this run — do NOT retry them; if the request "
+                        "needs one, report its error to the user instead:\n"
+                        + "\n".join(f"- {f.get('connector')}: {f.get('detail')}" for f in failed[-8:])
+                        + "\n\n")
     human = (
         f"{_skills.loaded_block(state.get('loaded_skills') or [])}"
         f"{_skills.index_block(state.get('skill_index') or [])}"
         f"{_history_block(state)}"
         f"User request:\n{state.get('query', '')}\n\n"
         f"Sources available: documents={state.get('has_documents')}, live_tools={state.get('has_live')}, "
-        f"action_tools={state.get('has_action')}\n"
+        f"action_tools={state.get('has_action')}, document_builder={state.get('has_produce')}\n"
+        f"{failed_block}"
         f"Findings so far:\n{_findings_block(state)}\n\n"
         f"Current step checklist:\n{_plan_block(state)}\n\n"
         f"Already answered: {bool(state.get('answered'))}"
@@ -335,9 +347,10 @@ async def controller_node(state: _g.AgentState) -> dict:
     # grows as planned; read/answer/ask become visible steps that reach a terminal status.
     plan = [dict(s) for s in (state.get("plan") or [])]
     dtype = decision.get("type")
-    if dtype in ("read", "answer", "act", "ask", "load_skill"):
+    if dtype in ("read", "answer", "act", "produce", "ask", "load_skill"):
         default_label = {"read": "Gather information", "answer": "Write the answer",
-                         "act": "Prepare the action", "ask": "Ask the user",
+                         "act": "Prepare the action", "produce": "Build the document",
+                         "ask": "Ask the user",
                          "load_skill": f"Follow the {decision.get('skill_name', '')} playbook"}[dtype]
         label = (decision.get("step_label") or "").strip() or default_label
         step_id = f"step-{loop_count}"
@@ -389,6 +402,8 @@ async def read_node(state: _g.AgentState) -> dict:
 
     artifact_refs = list(state.get("artifact_refs") or [])
     findings = list(state.get("findings") or [])
+    failed_tools = list(state.get("failed_tools") or [])
+    _failed_names = {f.get("connector") for f in failed_tools}
     add_chunks: list = []
     add_live: list = []
     add_whole: list = []
@@ -405,6 +420,15 @@ async def read_node(state: _g.AgentState) -> dict:
         for act in res.get("tool_activity", []):
             if writer:
                 writer({"type": "tool_activity", **act})
+        # Surface connector errors as findings so the controller reports the exact error
+        # and stops retrying the broken tool — instead of seeing only "no results" (spec §6).
+        for te in res.get("tool_errors", []):
+            conn = te.get("connector") or "a connected tool"
+            detail = te.get("detail") or "unavailable"
+            findings.append(f"[Tool error] {conn} is unavailable: {detail}")
+            if conn not in _failed_names:
+                _failed_names.add(conn)
+                failed_tools.append({"connector": conn, "detail": detail})
         n, ln = res.get("chunks_retrieved", 0), res.get("live_count", 0)
         total_n += n
         total_live += ln
@@ -447,8 +471,119 @@ async def read_node(state: _g.AgentState) -> dict:
 
     return {"context_chunks": chunks, "live_records": live, "whole_documents": whole,
             "citations": citations, "graph_context": graph_ctx,
-            "findings": findings, "artifact_refs": artifact_refs,
+            "findings": findings, "artifact_refs": artifact_refs, "failed_tools": failed_tools,
             "no_progress_count": no_progress, "read_signatures": signatures}
+
+
+async def produce_node(state: _g.AgentState) -> dict:
+    """Build a user-deliverable document (DOCUMENT_GENERATION_SANDBOX_GUIDE). One logical
+    step: the model writes a self-contained script → it runs in the locked-down sandbox →
+    mechanical validation → on failure, a bounded repair loop feeds the error back. On
+    success, emits a `deliverable` per file and a short caption; on exhaustion, degrades
+    honestly (never a dead-end). Locally side-effect-free → no approval gate."""
+    import urllib.parse
+
+    writer = get_stream_writer()
+    decision = state.get("decision") or {}
+    step_id = decision.get("_step_id") or f"step-{state.get('loop_count')}"
+    thread_id = state.get("thread_id") or "run"
+    attempts_so_far = int(state.get("produce_attempts") or 0)
+
+    if not (settings.agent_produce_enabled and has_capability(Capability.PRODUCE)):
+        if writer:
+            writer({"type": "step_status", "id": step_id, "status": "skipped"})
+        return {"findings": (state.get("findings") or [])
+                + ["The document builder isn't available, so no file was produced."]}
+
+    from agents.orchestrator import sandbox
+    spec = get_subagent(Capability.PRODUCE)
+    handler = spec.handler
+    request = (decision.get("request") or "").strip() or state.get("query", "")
+    findings = state.get("findings") or []
+    loaded_skills = state.get("loaded_skills") or []
+    job = await asyncio.to_thread(artifacts.job_dir, thread_id, step_id)
+    max_attempts = max(1, settings.agent_produce_max_attempts)
+
+    def _on_delta(text: str) -> None:
+        if writer:
+            writer({"type": "produce_script_delta", "step_id": step_id, "content": text})
+
+    last_error = ""
+    attempt = 0
+    while attempt < max_attempts:
+        attempt += 1
+        if writer:
+            writer({"type": "reasoning",
+                    "text": ("Putting the document together…" if attempt == 1
+                             else "Fixing an issue and rebuilding the document…")})
+            writer({"type": "produce_script_start", "step_id": step_id, "attempt": attempt})
+        try:
+            script = await handler.generate_script(
+                request=request, findings=findings, loaded_skills=loaded_skills,
+                error=(last_error or None), on_delta=_on_delta)
+        except Exception as exc:
+            logger.warning("produce: script generation failed: %s", exc)
+            last_error = f"Script generation failed: {exc}"
+            continue
+        if writer:
+            # The cleaned, fence-stripped script — the UI swaps the streamed text for this
+            # final version and collapses the inline card to a `script.py` pill.
+            writer({"type": "produce_script_end", "step_id": step_id, "code": script})
+        result = await sandbox.run_sandbox(script, job)
+        if not result.ok:
+            last_error = result.error_digest()
+            logger.info("produce attempt %s failed (%s)", attempt, result.classify())
+            continue
+        validation = await asyncio.to_thread(handler.validate, result.output_files)
+        if not validation.get("ok"):
+            last_error = validation.get("error", "validation failed")
+            logger.info("produce attempt %s failed validation: %s", attempt, last_error)
+            continue
+
+        # Success — turn each output file into a deliverable.
+        from agents.document_agent.agent import mime_for
+        deliverables = list(state.get("deliverables") or [])
+        new_caps: list[str] = []
+        for p in result.output_files:
+            filename = p.name
+            size = p.stat().st_size
+            quoted = urllib.parse.quote(filename)
+            dl = {
+                "artifact_id": f"{thread_id}/{step_id}/{filename}",
+                "step_id": step_id,
+                "filename": filename,
+                "mime": mime_for(filename),
+                "size": size,
+                "download_url": f"/api/agents/artifacts/{thread_id}/{step_id}/{quoted}",
+                "summary_caption": f"{filename} ({size // 1024 or 1} KB)",
+            }
+            deliverables.append(dl)
+            new_caps.append(filename)
+            if writer:
+                writer({"type": "deliverable", **dl})
+
+        names = ", ".join(new_caps)
+        caption = (f"I've prepared {names} — you can download it below."
+                   if len(new_caps) == 1 else
+                   f"I've prepared {len(new_caps)} files ({names}) — you can download them below.")
+        if writer:
+            writer({"type": "answer_token", "content": caption})
+            writer({"type": "step_status", "id": step_id, "status": "done"})
+        return {"deliverables": deliverables, "produce_attempts": attempts_so_far + attempt,
+                "answer": caption, "answered": True, "grounded": True,
+                "findings": findings + [f"Produced document(s): {names}."]}
+
+    # Exhausted attempts — degrade gracefully (visible-failure rule), never dead-end.
+    logger.warning("produce: exhausted %s attempts; last error: %s", max_attempts, last_error)
+    message = ("I wasn't able to build that document — the script kept failing when I ran it. "
+               "I can try a simpler version or a different format if you'd like.")
+    if writer:
+        writer({"type": "answer_token", "content": message})
+        writer({"type": "step_status", "id": step_id, "status": "failed"})
+    return {"produce_attempts": attempts_so_far + attempt, "answer": message,
+            "answered": True, "grounded": True,
+            "findings": findings + [f"Could not build the document after {max_attempts} "
+                                    f"attempts (last error: {last_error[:200]})."]}
 
 
 async def answer_node(state: _g.AgentState) -> dict:
@@ -854,6 +989,7 @@ async def finalize_node(state: _g.AgentState) -> dict:
                 "citations": state.get("citations", []),
                 "verification": state.get("verification", {}),
                 "proposed_action": None,
+                "deliverables": state.get("deliverables", []),
                 "grounded": state.get("grounded", True)})
     return {}
 
@@ -980,15 +1116,20 @@ def build_controller_graph(checkpointer=None):
     g.add_node("controller", controller_node)
     g.add_node("read", read_node)
     g.add_node("answer_step", answer_node)  # not "answer" — that's a state key
+    g.add_node("produce_step", produce_node)
     g.add_node("load_skill_step", load_skill_node)
     g.add_node("replan", replan_node)
     g.add_node("finalize", finalize_node)
     g.add_edge(START, "hydrate")
     g.add_edge("hydrate", "controller")
     g.add_edge("load_skill_step", "controller")
+    # produce is side-effect-free + uses no interrupt → loops back to the controller
+    # (the run continues: produce → narrate → done), needs no checkpointer.
+    g.add_edge("produce_step", "controller")
 
     route_map = {"read": "read", "answer": "answer_step", "replan": "replan", "done": "finalize",
                  "load_skill": "load_skill_step",  # no interrupt → no checkpointer needed
+                 "produce": "produce_step",
                  "ask": "answer_step"}  # ask falls back to answer without a checkpointer
     if checkpointer is not None:
         # Question gate (R7) — interrupt to ask the user, then continue.

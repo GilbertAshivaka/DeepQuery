@@ -14,6 +14,8 @@ Flow:
 
 import io
 import logging
+import os
+import shutil
 from dataclasses import dataclass
 from typing import Optional
 
@@ -21,6 +23,27 @@ import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_tesseract_cmd() -> Optional[str]:
+    """Find the Tesseract binary: explicit setting → PATH → common install dirs.
+    Returns the path to use (or None to leave pytesseract's default)."""
+    from core.config import settings
+
+    if settings.tesseract_cmd and os.path.isfile(settings.tesseract_cmd):
+        return settings.tesseract_cmd
+    if shutil.which("tesseract"):
+        return None  # on PATH — let pytesseract use its default
+    for candidate in (
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        "/usr/bin/tesseract",
+        "/usr/local/bin/tesseract",
+        "/opt/homebrew/bin/tesseract",
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 @dataclass
@@ -64,6 +87,10 @@ class OCRModule:
         except ImportError:
             logger.error("pytesseract not installed. OCR disabled.")
             return OCRResult(text="", confidence=0.0, is_usable=False, page_number=page_number)
+
+        resolved = _resolve_tesseract_cmd()
+        if resolved:
+            pytesseract.pytesseract.tesseract_cmd = resolved
 
         try:
             # Load image

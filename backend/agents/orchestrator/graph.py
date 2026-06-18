@@ -43,6 +43,7 @@ from agents.registry import Capability, get as get_subagent, has as has_capabili
 # Import sub-agent packages so they self-register with the capability registry.
 import agents.retrieval_agent  # noqa: F401
 import agents.action_agent  # noqa: F401
+import agents.document_agent  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +174,7 @@ class AgentState(TypedDict, total=False):
     read_signatures: list[str]   # source-signatures of executed reads (duplicate detection)
     no_progress_count: int       # consecutive reads that added no new evidence (stall)
     stall_replans: int           # forced re-plans so far (escalates to wrap-up)
+    failed_tools: list[dict]     # connectors that errored this run [{connector, detail}] — don't retry
     # Skills consumption (spec §2.10, R8)
     skill_names: list[str]       # explicitly-selected skills to load at hydration (run-level)
     skill_index: list[dict]      # {name,description,kind} for active skills (controller plans with)
@@ -180,6 +182,10 @@ class AgentState(TypedDict, total=False):
     has_documents: bool          # corpus available this run (hint to the controller)
     has_live: bool               # live tools available this run (hint to the controller)
     has_action: bool             # action tools available + durable (act decision enabled)
+    has_produce: bool            # document sandbox available this run (produce enabled)
+    # Document generation (DOCUMENT_GENERATION_SANDBOX_GUIDE)
+    deliverables: list[dict]     # produced docs [{artifact_id,filename,mime,size,download_url}]
+    produce_attempts: int        # total sandbox attempts across produce steps this run
     # Output
     answer: str
     grounded: bool

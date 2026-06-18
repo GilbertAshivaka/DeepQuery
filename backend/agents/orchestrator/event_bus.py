@@ -95,6 +95,8 @@ def _new_snapshot(thread_id: str, user_id: str = "") -> dict[str, Any]:
         "pending_approval": None,        # the approval_required / batch payload while paused
         "pending_question": None,        # the question payload while awaiting an answer (R7)
         "action_result": None,
+        "deliverables": [],              # produced documents (DOCUMENT_GENERATION_SANDBOX_GUIDE §7)
+        "scripts": [],                   # produce script.py code per step [{step_id,code,streaming}]
         "intent": None,
         "grounded": True,
         "error": None,
@@ -145,6 +147,31 @@ def _fold(snap: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
                                 "explanation": event.get("explanation", "")}
     elif t == "action_result":
         snap["action_result"] = {k: v for k, v in event.items() if k != "type"}
+    elif t == "deliverable":
+        snap.setdefault("deliverables", []).append(
+            {k: v for k, v in event.items() if k != "type"})
+    elif t == "produce_script_start":
+        sid = event.get("step_id")
+        scripts = snap.setdefault("scripts", [])
+        s = next((x for x in scripts if x.get("step_id") == sid), None)
+        if s is not None:
+            s["code"], s["streaming"] = "", True
+        else:
+            scripts.append({"step_id": sid, "code": "", "streaming": True})
+    elif t == "produce_script_delta":
+        sid = event.get("step_id")
+        for s in snap.get("scripts", []):
+            if s.get("step_id") == sid:
+                s["code"] = s.get("code", "") + event.get("content", "")
+                break
+    elif t == "produce_script_end":
+        sid = event.get("step_id")
+        for s in snap.get("scripts", []):
+            if s.get("step_id") == sid:
+                if event.get("code"):
+                    s["code"] = event["code"]
+                s["streaming"] = False
+                break
     elif t == "done":
         if event.get("paused"):
             # A paused `done` follows an approval_required/question that already set the

@@ -36,12 +36,15 @@ export default function ConnectorDetailPanel({ connector, onClose }) {
     <div className="w-96 flex-shrink-0 border-l border-cream-200 bg-white flex flex-col h-full animate-slide-right">
       {/* Header */}
       <div className="flex items-center justify-between px-5 h-14 border-b border-cream-200 flex-shrink-0">
-        <div className="min-w-0">
-          <h3 className="font-semibold text-ink-900 text-sm truncate">{connector.name}</h3>
-          <p className="text-[11px] text-sand-500">
-            {connector.auth_method && <span className="capitalize">{connector.auth_method}</span>}
-            {connector.version ? ` · v${connector.version}` : ''}
-          </p>
+        <div className="flex items-center gap-2.5 min-w-0">
+          <HeaderIcon name={connector.name} iconUrl={data?.server_icon || connector.icon_url} />
+          <div className="min-w-0">
+            <h3 className="font-semibold text-ink-900 text-sm truncate">{data?.server_title || connector.name}</h3>
+            <p className="text-[11px] text-sand-500">
+              {connector.auth_method && <span className="capitalize">{connector.auth_method}</span>}
+              {connector.version ? ` · v${connector.version}` : ''}
+            </p>
+          </div>
         </div>
         <div className="flex items-center gap-1">
           <button onClick={load} className="btn-ghost !p-1" title="Re-discover"><RefreshCw size={15} /></button>
@@ -64,6 +67,12 @@ export default function ConnectorDetailPanel({ connector, onClose }) {
               <p className="text-xs text-ink-600">
                 Server: <span className="font-medium text-ink-800">{data.server_label}</span>
               </p>
+            )}
+            {data.website_url && (
+              <a href={data.website_url} target="_blank" rel="noreferrer"
+                 className="text-xs text-violet-600 hover:underline break-all">
+                {data.website_url}
+              </a>
             )}
 
             {/* Tools — reads vs actions */}
@@ -105,6 +114,21 @@ export default function ConnectorDetailPanel({ connector, onClose }) {
       </div>
     </div>
   );
+}
+
+// Connector logo: the server's own icon when available, else a colored monogram (with an
+// image-load fallback to the monogram).
+function HeaderIcon({ name, iconUrl }) {
+  const [failed, setFailed] = useState(false);
+  const letter = (name || '?').trim().charAt(0).toUpperCase();
+  const base = 'flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center overflow-hidden';
+  if (iconUrl && !failed) {
+    return (
+      <img src={iconUrl} alt="" onError={() => setFailed(true)}
+           className={`${base} bg-white border border-cream-200 object-contain`} />
+    );
+  }
+  return <div className={`${base} bg-violet-500/10 text-violet-600 font-semibold text-sm`}>{letter}</div>;
 }
 
 function Section({ icon: Icon, label, count, children }) {

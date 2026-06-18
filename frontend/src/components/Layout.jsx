@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { Outlet, NavLink, useNavigate, useLocation } from 'react-router-dom';
 import ErrorBoundary from './ErrorBoundary';
+import ToastContainer from './ui/ToastContainer';
 import { useAuthStore } from '../store/authStore';
 import { useChatStore } from '../store/chatStore';
 import {
@@ -95,6 +96,8 @@ export default function Layout() {
 
   return (
     <div className="flex h-screen overflow-hidden bg-cream-50">
+      {/* App-wide ephemeral notifications (errors, info) */}
+      <ToastContainer />
       {/* Sidebar */}
       <aside
         className={`

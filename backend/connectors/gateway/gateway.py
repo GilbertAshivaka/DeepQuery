@@ -23,7 +23,7 @@ from connectors.gateway.action_gate import ActionGateError, action_gate
 from connectors.gateway.audit import record_call
 from connectors.gateway.deployment import DeploymentError, assert_connector_permitted
 from connectors.gateway.health import CircuitOpenError, circuit_breaker
-from connectors.gateway.registry import ConnectorRef, get_connector_ref
+from connectors.gateway.registry import ConnectorRef, get_connector_ref, set_connector_icon
 from connectors.governance import GovernanceError, check_access
 from connectors.mcp_client.client import MCPConnectorClient, MCPClientError
 from connectors.mcp_client.transports import STDIO, TransportConfig
@@ -224,12 +224,31 @@ class ConnectorGateway:
         primitives (tools, resources, prompts)."""
         ref = await self._resolve(connector_id=connector_id, name=name)
         self._assert_deployment(ref)
+        # Discovery shares the read path's circuit breaker (keyed by connector name): a
+        # connector that repeatedly fails to even handshake fast-fails instead of making
+        # every query wait out its connect timeout again.
+        self._breaker_check(ref)
         client = await self._make_client(ref, user_id)
         try:
             discovery = await client.discover()
         except MCPClientError as exc:
+            circuit_breaker.record_failure(ref.name, str(exc))
             raise GatewayError(f"the '{ref.name}' connector is unavailable: {exc}") from exc
+        circuit_breaker.record_success(ref.name)
+        # Cache the server's self-declared icon (only writes when it changed).
+        if discovery.server_icon:
+            await asyncio.to_thread(self._persist_icon, ref.id, discovery.server_icon)
         return ref, discovery
+
+    @staticmethod
+    def _persist_icon(connector_id: str, icon_url: str) -> None:
+        db = SessionLocal()
+        try:
+            set_connector_icon(db, connector_id=connector_id, icon_url=icon_url)
+        except Exception:  # icon caching is best-effort; never fail discovery over it
+            db.rollback()
+        finally:
+            db.close()
 
     # -- read path --------------------------------------------------------
     async def read(

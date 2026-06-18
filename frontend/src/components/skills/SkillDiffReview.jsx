@@ -81,7 +81,9 @@ export default function SkillDiffReview({ proposal, skillName, busy, resolved, o
         </div>
         {proposal.trigger_summary && <p className="text-xs text-ink-600 leading-snug">{proposal.trigger_summary}</p>}
         {proposal.trigger_document_id && (
-          <p className="text-[10px] text-sand-500 font-mono mt-0.5">doc: {proposal.trigger_document_id}</p>
+          <p className="text-[10px] text-sand-500 font-mono mt-0.5" title={proposal.trigger_document_id}>
+            doc: {proposal.trigger_document_name || proposal.trigger_document_id}
+          </p>
         )}
       </div>
 

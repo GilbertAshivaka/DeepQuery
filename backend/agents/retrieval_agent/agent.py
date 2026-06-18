@@ -171,6 +171,9 @@ class RetrievalAgent:
             "chunks_retrieved": chunks_retrieved,
             "live_count": len(live_records),
             "tool_activity": tool_activity,
+            # Connectors that failed this gather (discovery/execution) — the controller
+            # reports these and stops retrying the broken tool (spec §6).
+            "tool_errors": live.get("tool_errors", []),
         }
         if error:
             result["error"] = error

@@ -29,6 +29,7 @@ class Capability(str, Enum):
     RETRIEVAL = "retrieval"      # gather grounded context (document + live)
     ACTION = "action"            # gated, state-mutating actions (Phase 3)
     VERIFICATION = "verification"  # self-correction / groundedness check
+    PRODUCE = "produce"          # generate a user-deliverable document via the sandbox
 
 
 @dataclass(frozen=True)

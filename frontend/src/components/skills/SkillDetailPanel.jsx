@@ -108,7 +108,7 @@ export default function SkillDetailPanel({ skillId, onClose, onChanged }) {
                   {skill.dependencies.map((d, i) => (
                     <div key={i} className="flex items-center gap-2 text-xs">
                       <span className="badge bg-cream-200 text-ink-600 capitalize">{d.dep_type}</span>
-                      <span className="text-ink-700 font-mono truncate flex-1">{d.dep_ref}</span>
+                      <span className="text-ink-700 font-mono truncate flex-1" title={d.dep_ref}>{d.dep_ref_name || d.dep_ref}</span>
                       <span className={`badge ${d.declared ? 'bg-forest-500/10 text-forest-500' : 'bg-sand-500/10 text-sand-600'}`}>
                         {d.declared ? 'explicit' : 'inferred'}
                       </span>

@@ -16,6 +16,7 @@ POST   /api/skills/proposals/{id}/reject    reject a proposal (logged)
 """
 
 import json
+import re
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -25,12 +26,41 @@ from sqlalchemy.orm import Session
 from auth.dependencies import RoleRequired
 from core.constants import UserRole
 from core.database import get_db
-from models.database import User
+from models.database import Document, User
 from skills import service
 from skills.parser import SkillFormatError, parse_skill_markdown
 
 router = APIRouter()
 admin_only = RoleRequired([UserRole.ADMIN])
+
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
+# ── Human-readable labels for the UUIDs surfaced in the Skills UI ────
+def _label_map(db: Session, ids: set[str]) -> dict[str, str]:
+    """Resolve a set of UUIDs to readable labels: documents → original filename,
+    users → full name. UUIDs that resolve to neither are simply omitted (callers
+    fall back to showing the raw id). The underlying ids are untouched — this only
+    affects what admins read."""
+    ids = {i for i in ids if i}
+    if not ids:
+        return {}
+    labels: dict[str, str] = {}
+    for doc in db.query(Document.id, Document.original_filename).filter(Document.id.in_(ids)):
+        if doc.original_filename:
+            labels[doc.id] = doc.original_filename
+    for u in db.query(User.id, User.full_name, User.username).filter(User.id.in_(ids)):
+        labels.setdefault(u.id, u.full_name or u.username)
+    return labels
+
+
+def _humanize(text: Optional[str], labels: dict[str, str]) -> Optional[str]:
+    """Replace any known UUID inside a free-text string with its readable label."""
+    if not text:
+        return text
+    return _UUID_RE.sub(lambda m: labels.get(m.group(0), m.group(0)), text)
 
 
 # ── Schemas ──────────────────────────────────────────────────
@@ -65,11 +95,14 @@ def _skill_out(skill) -> dict:
     }
 
 
-def _proposal_out(p) -> dict:
+def _proposal_out(p, labels: Optional[dict[str, str]] = None) -> dict:
+    labels = labels or {}
     return {
         "id": p.id, "skill_id": p.skill_id, "fact_section": p.fact_section,
         "old_content": p.old_content, "new_content": p.new_content,
-        "trigger_document_id": p.trigger_document_id, "trigger_summary": p.trigger_summary,
+        "trigger_document_id": p.trigger_document_id,
+        "trigger_document_name": labels.get(p.trigger_document_id),
+        "trigger_summary": p.trigger_summary,
         "confidence": p.confidence, "status": p.status,
         "created_at": p.created_at,
     }
@@ -107,7 +140,9 @@ def create_skill(body: CreateSkillRequest, db: Session = Depends(get_db), admin:
 # as a skill_id path param)
 @router.get("/proposals")
 def list_proposals(status: str = "pending", db: Session = Depends(get_db), _admin: User = Depends(admin_only)):
-    return [_proposal_out(p) for p in service.list_proposals(db, status=status or None)]
+    proposals = service.list_proposals(db, status=status or None)
+    labels = _label_map(db, {p.trigger_document_id for p in proposals})
+    return [_proposal_out(p, labels) for p in proposals]
 
 
 @router.post("/proposals/{proposal_id}/approve")
@@ -134,17 +169,31 @@ def get_skill(skill_id: str, db: Session = Depends(get_db), _admin: User = Depen
     skill = service.get_skill(db, skill_id)
     if skill is None:
         raise HTTPException(status_code=404, detail="skill not found")
+    versions = service.list_versions(db, skill_id)
+    deps = service.list_dependencies(db, skill_id)
+
+    # Collect every UUID that may appear in version attribution / summaries (doc &
+    # user ids) plus document dependency refs, and resolve them to readable labels.
+    ids: set[str] = set()
+    for v in versions:
+        ids.update(_UUID_RE.findall(f"{v.triggered_by or ''} {v.change_summary or ''}"))
+    ids.update(d.dep_ref for d in deps if d.dep_type == "document")
+    labels = _label_map(db, ids)
+
     out = _skill_out(skill)
     out["body"] = skill.body
     out["versions"] = [
-        {"version_no": v.version_no, "triggered_by": v.triggered_by,
-         "change_summary": v.change_summary, "created_at": v.created_at}
-        for v in service.list_versions(db, skill_id)
+        {"version_no": v.version_no,
+         "triggered_by": _humanize(v.triggered_by, labels),
+         "change_summary": _humanize(v.change_summary, labels),
+         "created_at": v.created_at}
+        for v in versions
     ]
     out["dependencies"] = [
-        {"dep_type": d.dep_type, "dep_ref": d.dep_ref, "declared": d.declared,
-         "fact_section": d.fact_section}
-        for d in service.list_dependencies(db, skill_id)
+        {"dep_type": d.dep_type, "dep_ref": d.dep_ref,
+         "dep_ref_name": labels.get(d.dep_ref) if d.dep_type == "document" else None,
+         "declared": d.declared, "fact_section": d.fact_section}
+        for d in deps
     ]
     return out
 

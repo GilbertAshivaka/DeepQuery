@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Awaitable
+from typing import Any, AsyncIterator, Awaitable, Optional
 
 from mcp import types
 from mcp.client.session import ClientSession
@@ -116,7 +116,11 @@ class MCPConnectorClient:
         so we never call a method a server doesn't support."""
         async with self._session() as (session, init):
             caps = init.capabilities
-            label = getattr(init.serverInfo, "name", None) or self.config.name
+            info = init.serverInfo
+            label = getattr(info, "name", None) or self.config.name
+            title = getattr(info, "title", None)
+            website = getattr(info, "websiteUrl", None)
+            icon = self._pick_icon(getattr(info, "icons", None))
             supports = {
                 "tools": caps.tools is not None,
                 "resources": caps.resources is not None,
@@ -141,7 +145,25 @@ class MCPConnectorClient:
                 tools=tools,
                 resources=resources,
                 prompts=prompts,
+                server_title=title,
+                server_icon=icon,
+                website_url=str(website) if website else None,
             )
+
+    @staticmethod
+    def _pick_icon(icons: Any) -> Optional[str]:
+        """Choose one icon URL from the server's declared MCP icons. Prefers an https
+        source; otherwise takes the first. Returns None if the server declares none."""
+        if not icons:
+            return None
+        srcs = [str(getattr(ic, "src", "")) for ic in icons if getattr(ic, "src", "")]
+        srcs = [s for s in srcs if s]
+        if not srcs:
+            return None
+        for s in srcs:
+            if s.startswith("https://") or s.startswith("data:"):
+                return s
+        return srcs[0]
 
     async def _safe_list_tools(self, session: ClientSession) -> list[DiscoveredTool]:
         try:

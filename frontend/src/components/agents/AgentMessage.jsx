@@ -1,14 +1,16 @@
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import {
   AlertCircle, Copy, Check, ShieldQuestion, Loader2, FileText, Image as ImageIcon,
-  CheckCircle2, XCircle, AlertTriangle, Sparkles, HelpCircle, Send, Link2,
+  CheckCircle2, XCircle, AlertTriangle, Sparkles, HelpCircle, Send, Link2, RefreshCw,
+  FileCode2, FileSpreadsheet, Download,
 } from 'lucide-react';
 import SelfCorrectionBadge from '../chat/SelfCorrectionBadge';
 import PlanChecklist from './PlanChecklist';
 import ThinkingPanel from './ThinkingPanel';
 import CitationChips from './CitationChips';
 import AnswerMarkdown from './AnswerMarkdown';
+import * as agentService from '../../services/agentService';
 
 export default function AgentMessage({
   turn,
@@ -18,6 +20,8 @@ export default function AgentMessage({
   onResolveApproval,
   onResolveBatch,
   onAnswerQuestion,
+  onOpenCode,
+  onRetry,
 }) {
   const isUser = turn.role === 'user';
   const [copied, setCopied] = useState(false);
@@ -91,11 +95,14 @@ export default function AgentMessage({
       {/* Anthropic-style CoT timeline (auto-collapses when done) */}
       <ThinkingPanel trace={turn.trace} isStreaming={isStreaming} />
 
+      {/* Document build script(s): stream inline, then collapse to a script.py pill. */}
+      <ScriptArtifacts scripts={turn.scripts} onOpenCode={onOpenCode} />
+
       {/* Answer */}
-      {turn.isError ? (
-        <div className="flex items-start gap-2 text-terra-500 text-sm">
-          <AlertCircle size={16} className="flex-shrink-0 mt-0.5" />
-          <p>{turn.content}</p>
+      {turn.isError && !turn.content ? (
+        <div className="flex items-center gap-2 text-ink-500 text-xs">
+          <AlertCircle size={14} className="flex-shrink-0 text-terra-500/70" />
+          <p>This response didn’t complete. The error is shown in a notification.</p>
         </div>
       ) : turn.content ? (
         <div className="relative">
@@ -114,6 +121,9 @@ export default function AgentMessage({
           )}
         </div>
       ) : null}
+
+      {/* Produced documents — download cards. */}
+      <DeliverableCards deliverables={turn.deliverables} />
 
       {/* Citations — four source kinds, grouped */}
       <CitationChips
@@ -137,6 +147,25 @@ export default function AgentMessage({
         <QuestionGate question={turn.question} threadId={turn.threadId} onAnswer={onAnswerQuestion} />
       )}
 
+      {/* The run was interrupted by a server restart — calm notice + re-ask. */}
+      {turn.runInterrupted && !isStreaming && (
+        <div className="mt-3 flex items-center gap-3 rounded-xl border border-cream-200 bg-cream-50/60 px-3.5 py-3">
+          <AlertTriangle size={16} className="flex-shrink-0 text-amber-700" />
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-medium text-ink-900">This run was interrupted</p>
+            <p className="text-[11px] text-ink-600">The server restarted before it finished. You can ask again.</p>
+          </div>
+          {onRetry && (
+            <button
+              onClick={() => onRetry(turn)}
+              className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-amber-900 text-white hover:bg-amber-950 active:scale-[0.98] transition-all"
+            >
+              <RefreshCw size={13} /> Try again
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Footer: verification badge + copy */}
       {!isStreaming && turn.content && !turn.isError && (
         <div className="mt-1.5 flex items-center gap-2">
@@ -155,6 +184,119 @@ export default function AgentMessage({
         </div>
       )}
     </motion.div>
+  );
+}
+
+// ── Document generation (DOCUMENT_GENERATION_SANDBOX_GUIDE) ──
+
+// The build script(s) for a produce step. While the model writes it, the code streams
+// in an inline card; when done it collapses to a script.py pill that opens the code panel.
+function ScriptArtifacts({ scripts, onOpenCode }) {
+  if (!scripts?.length) return null;
+  return (
+    <div className="mb-2 space-y-2">
+      {scripts.map((s) =>
+        s.streaming ? (
+          <StreamingScriptCard key={s.stepId} code={s.code} />
+        ) : (
+          <button
+            key={s.stepId}
+            onClick={() => onOpenCode?.({ code: s.code, title: 'script.py', language: 'python' })}
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-cream-100 border border-cream-200
+              text-xs text-ink-700 hover:bg-cream-200 hover:border-cream-300 active:scale-[0.98] transition-all"
+            title="View the script that built the document"
+          >
+            <FileCode2 size={14} className="text-violet-500" />
+            <span className="font-mono">script.py</span>
+          </button>
+        )
+      )}
+    </div>
+  );
+}
+
+// Inline card that shows the script being written live (auto-scrolls to the tail). Plain
+// <pre> rather than the highlighter — re-tokenizing on every delta would be wasteful; the
+// pill's code panel does the syntax highlighting.
+function StreamingScriptCard({ code }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
+  }, [code]);
+  return (
+    <div className="rounded-xl border border-cream-200 bg-cream-100 overflow-hidden">
+      <div className="flex items-center gap-2 px-3 py-1.5 bg-cream-200/50 border-b border-cream-200">
+        <Loader2 size={12} className="animate-spin text-violet-500 flex-shrink-0" />
+        <span className="text-[11px] text-sand-600 font-medium">Writing the document script…</span>
+      </div>
+      <pre
+        ref={ref}
+        className="text-[11px] leading-relaxed p-3 max-h-52 overflow-y-auto text-ink-700 font-mono whitespace-pre-wrap"
+      >
+        {code || '…'}
+      </pre>
+    </div>
+  );
+}
+
+// Document type → icon (a small visual cue on the download card).
+function deliverableIcon(filename) {
+  const ext = (filename || '').toLowerCase().split('.').pop();
+  if (ext === 'xlsx' || ext === 'csv') return FileSpreadsheet;
+  return FileText;
+}
+
+function formatSize(bytes) {
+  if (!bytes && bytes !== 0) return 'Document';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function DeliverableCards({ deliverables }) {
+  if (!deliverables?.length) return null;
+  return (
+    <div className="mt-3 space-y-2">
+      {deliverables.map((d, i) => (
+        <DeliverableCard key={d.download_url || i} d={d} />
+      ))}
+    </div>
+  );
+}
+
+function DeliverableCard({ d }) {
+  const [busy, setBusy] = useState(false);
+  const Icon = deliverableIcon(d.filename);
+  const download = async () => {
+    setBusy(true);
+    try {
+      await agentService.downloadFile(d.download_url, d.filename);
+    } catch {
+      /* a toast is shown by the caller's error path elsewhere; swallow here */
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="flex items-center gap-3 rounded-xl border border-cream-200 bg-white px-3.5 py-3 w-full shadow-warm-sm">
+      <div className="flex-shrink-0 w-9 h-9 rounded-lg bg-violet-500/10 flex items-center justify-center">
+        <Icon size={18} className="text-violet-600" />
+      </div>
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-medium text-ink-900 truncate">{d.filename}</p>
+        <p className="text-[11px] text-ink-500">{formatSize(d.size)}</p>
+      </div>
+      <button
+        onClick={download}
+        disabled={busy}
+        className="flex-shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg
+          bg-amber-900 text-white hover:bg-amber-950 disabled:opacity-50 active:scale-[0.98] transition-all"
+        title="Download"
+      >
+        {busy ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+        Download
+      </button>
+    </div>
   );
 }
 
@@ -276,6 +418,7 @@ function BatchApprovalGate({ batch, threadId, onResolve }) {
   );
   const pending = batch.status === 'pending';
   const working = batch.status === 'approving';
+  const record = batch.record || batch.status === 'record'; // rehydrated, run not live
   const toggle = (id) =>
     setDecisions((d) => ({ ...d, [id]: d[id] === 'approve' ? 'reject' : 'approve' }));
   const approveCount = Object.values(decisions).filter((v) => v === 'approve').length;
@@ -285,7 +428,9 @@ function BatchApprovalGate({ batch, threadId, onResolve }) {
       <div className="px-3.5 py-2.5 flex items-center gap-2 border-b border-amber-700/15">
         <ShieldQuestion size={15} className="text-amber-700 flex-shrink-0" />
         <p className="text-xs font-medium text-ink-900">
-          {batch.items.length} actions need your approval
+          {record
+            ? `${batch.items.length} actions were proposed`
+            : `${batch.items.length} actions need your approval`}
         </p>
       </div>
 
@@ -307,6 +452,8 @@ function BatchApprovalGate({ batch, threadId, onResolve }) {
                   onChange={() => toggle(it.pending_id)}
                   className="flex-shrink-0 w-4 h-4 accent-amber-900 cursor-pointer"
                 />
+              ) : record ? (
+                <span className="flex-shrink-0 w-4 h-4 rounded-full border border-cream-300" />
               ) : (
                 <Loader2 size={15} className="animate-spin text-ink-500 flex-shrink-0" />
               )}
@@ -361,6 +508,8 @@ function BatchApprovalGate({ batch, threadId, onResolve }) {
 function QuestionGate({ question, threadId, onAnswer }) {
   const [value, setValue] = useState('');
   const answered = question.status === 'answered';
+  // A rehydrated record whose run is no longer live — show it read-only (no live input).
+  const readOnly = question.record && !answered;
 
   const submit = (e) => {
     e.preventDefault();
@@ -381,6 +530,8 @@ function QuestionGate({ question, threadId, onAnswer }) {
             <p className="mt-2 text-xs text-ink-700">
               <span className="text-ink-500">You answered:</span> {question.answer}
             </p>
+          ) : readOnly ? (
+            <p className="mt-1.5 text-[11px] text-ink-500 italic">This question wasn’t answered.</p>
           ) : (
             <form onSubmit={submit} className="mt-2 flex items-end gap-2">
               <textarea

@@ -30,6 +30,7 @@ export default function RegisterConnectorModal({ onClose, onRegistered }) {
   const [step, setStep] = useState('form');
 
   const [name, setName] = useState('');
+  const [summary, setSummary] = useState('');
   const [transport, setTransport] = useState('http');
   const [version, setVersion] = useState('');
   const [requiresNetwork, setRequiresNetwork] = useState(true);
@@ -73,6 +74,7 @@ export default function RegisterConnectorModal({ onClose, onRegistered }) {
     try {
       const createdConn = await connectorService.registerConnector({
         name: name.trim(),
+        summary: summary.trim() || null,
         transport,
         endpoint: buildEndpoint(),
         version: version.trim() || null,
@@ -120,6 +122,7 @@ export default function RegisterConnectorModal({ onClose, onRegistered }) {
     try {
       const updated = await connectorService.registerConnector({
         name: created.name,
+        summary: summary.trim() || null,
         transport,
         endpoint: buildEndpoint(),
         version: version.trim() || null,
@@ -176,6 +179,11 @@ export default function RegisterConnectorModal({ onClose, onRegistered }) {
           <>
             <Field label="Name">
               <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Linear" />
+            </Field>
+
+            <Field label="Description (helps the agent pick this connector)">
+              <textarea className="input text-sm" rows={2} value={summary} onChange={(e) => setSummary(e.target.value)}
+                        placeholder="e.g. Linear issue tracker — search and read issues, projects, and comments." />
             </Field>
 
             <div className="grid grid-cols-2 gap-3">

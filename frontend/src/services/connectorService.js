@@ -13,8 +13,9 @@ export async function listConnectors() {
 }
 
 export async function registerConnector(body) {
+  // body may include `summary` (one-line description that drives agent routing + UI).
   const { data } = await api.post('/api/connectors', body);
-  return data; // {id, name, version, transport, requires_network}
+  return data; // {id, name, version, transport, requires_network, summary, icon_url}
 }
 
 // Delete a connector from the registry entirely (admin) — purges approval,

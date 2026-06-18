@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -94,9 +95,14 @@ async def _drive_run(
     answer_parts: list[str] = []
     final: dict = {}
     pending_approval: dict = {}
+    pending_question: dict = {}
+    pending_batch: dict = {}
+    skills_acc: list[dict] = []
     citations_payload = None
     plan_state: list[dict] = []
     trace_acc: list[dict] = []
+    deliverables: list[dict] = []
+    scripts_acc: list[dict] = []  # produce script.py code per step (pill → code panel)
 
     await event_bus.init_run(thread_id, user_id)
     await event_bus.publish(thread_id, {"type": "run_started", "thread_id": thread_id,
@@ -136,6 +142,32 @@ async def _drive_run(
                                   "detail": event.get("detail"), "status": event.get("status")})
             elif t == "approval_required":
                 pending_approval = event
+            elif t == "batch_approval_required":
+                pending_batch = event
+            elif t == "question":
+                pending_question = event
+            elif t == "skill_loaded":
+                # Surfaced as a chip (cot.skills), not a trace line — matches the live UI.
+                skills_acc.append({"name": event.get("name"), "version": event.get("version")})
+            elif t == "deliverable":
+                deliverables.append({k: v for k, v in event.items() if k != "type"})
+            elif t == "produce_script_start":
+                sid = event.get("step_id")
+                s = next((x for x in scripts_acc if x.get("step_id") == sid), None)
+                if s is not None:
+                    s["code"] = ""  # repair attempt restarts the script
+                else:
+                    scripts_acc.append({"step_id": sid, "code": ""})
+            elif t == "produce_script_delta":
+                sid = event.get("step_id")
+                s = next((x for x in scripts_acc if x.get("step_id") == sid), None)
+                if s is not None:
+                    s["code"] += event.get("content", "")
+            elif t == "produce_script_end":
+                sid = event.get("step_id")
+                s = next((x for x in scripts_acc if x.get("step_id") == sid), None)
+                if s is not None and event.get("code"):
+                    s["code"] = event["code"]  # the cleaned, fence-stripped final script
             elif t == "done":
                 final = event
     except Exception as exc:
@@ -147,15 +179,23 @@ async def _drive_run(
         conversation_id=conversation_id, final=final, answer_parts=answer_parts,
         pending_approval=pending_approval, citations_payload=citations_payload,
         plan_state=plan_state, trace_acc=trace_acc,
+        thread_id=thread_id, user_id=user_id, deliverables=deliverables,
+        pending_question=pending_question, pending_batch=pending_batch, skills=skills_acc,
+        scripts=scripts_acc,
     )
 
 
 def _persist_assistant_turn(*, conversation_id, final, answer_parts, pending_approval,
-                            citations_payload, plan_state, trace_acc) -> None:
+                            citations_payload, plan_state, trace_acc,
+                            thread_id="", user_id="", deliverables=None,
+                            pending_question=None, pending_batch=None, skills=None,
+                            scripts=None) -> None:
     """Persist the completed/paused run as an assistant turn (own DB session — the request
-    is long gone). Behavior preserved verbatim from the former in-request path."""
+    is long gone). Produced documents (DOCUMENT_GENERATION_SANDBOX_GUIDE §7) are attached to
+    the turn as AgentAttachment rows so a reloaded conversation keeps them, served by the
+    existing /attachments/{id}/content endpoint."""
     from core.database import SessionLocal
-    from models.database import AgentConversation, AgentTurn
+    from models.database import AgentAttachment, AgentConversation, AgentTurn
 
     sdb = SessionLocal()
     try:
@@ -164,7 +204,20 @@ def _persist_assistant_turn(*, conversation_id, final, answer_parts, pending_app
         proposed = final.get("proposed_action")
         if not proposed and pending_approval:
             proposed = {k: v for k, v in pending_approval.items() if k != "type"}
-        cot = {"plan": plan_state, "trace": trace_acc}
+        # Fold the controller surfaces into cot so a reloaded conversation keeps them
+        # (the question the agent asked, a pending batch plan, loaded playbooks). These
+        # rehydrate as read-only records; a still-live run overlays the actionable form.
+        cot: dict = {"plan": plan_state, "trace": trace_acc, "thread_id": thread_id}
+        if skills:
+            cot["skills"] = skills
+        if pending_question:
+            cot["question"] = {k: v for k, v in pending_question.items() if k != "type"}
+        if pending_batch:
+            cot["batch"] = {k: v for k, v in pending_batch.items() if k != "type"}
+        if scripts:
+            cot["scripts"] = scripts  # [{step_id, code}] — rehydrates the script.py pill
+        has_cot = bool(plan_state or trace_acc or skills or pending_question
+                       or pending_batch or scripts)
         turn = AgentTurn(
             conversation_id=conversation_id,
             role="assistant",
@@ -174,9 +227,25 @@ def _persist_assistant_turn(*, conversation_id, final, answer_parts, pending_app
             grounded=final.get("grounded"),
             verification_status=verification.get("outcome"),
             proposed_action=json.dumps(proposed) if proposed else None,
-            agent_trace=json.dumps(cot) if (plan_state or trace_acc) else None,
+            agent_trace=json.dumps(cot) if has_cot else None,
         )
         sdb.add(turn)
+        sdb.flush()  # assign turn.id for attachment links
+        for d in (deliverables or []):
+            src = _deliverable_path(thread_id, d.get("artifact_id"))
+            if not src:
+                continue
+            # Copy into the durable attachments store (never swept) so the deliverable
+            # survives the run's transient job dir being TTL-swept. Fall back to the
+            # job-dir path if the copy fails (still works until the sweeper runs).
+            durable = _copy_to_attachments_store(src) or src
+            sdb.add(AgentAttachment(
+                user_id=user_id, conversation_id=conversation_id, turn_id=turn.id,
+                kind="document", filename=d.get("filename") or "document",
+                content_type=d.get("mime"),
+                file_extension=os.path.splitext(d.get("filename") or "")[1].lower() or None,
+                stored_path=durable,
+            ))
         c = sdb.query(AgentConversation).filter(AgentConversation.id == conversation_id).first()
         if c is not None:
             c.updated_at = datetime.now(timezone.utc)
@@ -185,6 +254,39 @@ def _persist_assistant_turn(*, conversation_id, final, answer_parts, pending_app
         sdb.rollback()
     finally:
         sdb.close()
+
+
+def _copy_to_attachments_store(src_path: str) -> Optional[str]:
+    """Copy a produced file into the durable agent-attachments store (where user uploads
+    live; the sweeper never touches it), so the deliverable persists after the run's
+    transient artifact job dir is TTL-swept. Returns the durable path, or None on failure."""
+    import shutil
+    import uuid as _uuid
+
+    from core.config import settings
+    try:
+        ext = os.path.splitext(src_path)[1].lower()
+        store = settings.document_store_dir / "agent_attachments"
+        store.mkdir(parents=True, exist_ok=True)
+        dest = store / f"{_uuid.uuid4().hex}{ext}"
+        shutil.copy2(src_path, dest)
+        return str(dest)
+    except Exception as exc:
+        logger.warning("deliverable durable-copy failed (%s): %s", src_path, exc)
+        return None
+
+
+def _deliverable_path(thread_id: str, artifact_id: Optional[str]) -> Optional[str]:
+    """Resolve a deliverable's on-disk path from its ``thread/step/filename`` ref, for the
+    durable AgentAttachment record."""
+    if not artifact_id:
+        return None
+    parts = artifact_id.split("/", 2)
+    if len(parts) != 3:
+        return None
+    from agents.orchestrator import artifacts
+    p = artifacts.output_file(parts[0], parts[1], parts[2])
+    return str(p) if p else None
 
 
 # ── Resume driver ────────────────────────────────────────────
@@ -196,7 +298,12 @@ async def _drive_resume(*, thread_id: str, decision: Optional[str], approver_id:
     and the R6 batch gate (``batch_decisions``). Persistence helpers live in the API layer
     (shared with the legacy approve/reject endpoints); imported lazily."""
     from agents.orchestrator import event_bus, orchestrator
-    from api.agents import _persist_action_resolution, _update_turn_gate
+    from api.agents import _persist_action_resolution, _update_turn_gate, _update_turn_question
+
+    # Record the user's answer on the originating question turn (so the resolved Q&A
+    # rehydrates), regardless of how the continuation ends.
+    if answer:
+        _update_turn_question(thread_id, answer)
 
     final: dict = {}
     action_res: dict = {}

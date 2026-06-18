@@ -13,7 +13,7 @@ GET  /api/agents/health                       — model slots + capabilities
 SSE event types:
   run_started · plan · step_status · reasoning · thinking · tool_activity ·
   citations · answer_token · verification_result · approval_required ·
-  action_result · done · error
+  action_result · deliverable · done · error
 
 Durable runs (RESUMABLE_AGENT_SPEC_V2 phase 1): an action run pauses at the
 approval gate (checkpointed in Redis under its per-run thread_id, carried in
@@ -244,6 +244,32 @@ def get_attachment_content(attachment_id: str, user: User = Depends(get_current_
         media_type=a.content_type or "application/octet-stream",
         filename=a.filename,
         content_disposition_type="inline",
+    )
+
+
+# ── Produced documents (DOCUMENT_GENERATION_SANDBOX_GUIDE §7) ─
+@router.get("/artifacts/{thread_id}/{step_id}/{filename}")
+async def download_artifact(
+    thread_id: str, step_id: str, filename: str,
+    user: User = Depends(get_current_user),
+):
+    """Serve a document produced by a `produce` step, from the artifact store. Authorized
+    by run ownership: the requester must own the run (per the run's event-bus snapshot).
+    The deliverable event carries this URL; once the run is persisted, the durable copy is
+    also reachable as an AgentAttachment via /attachments/{id}/content."""
+    from agents.document_agent.agent import mime_for
+    from agents.orchestrator import artifacts, event_bus
+
+    snap = await event_bus.get_snapshot(thread_id)
+    if not snap or snap.get("user_id") != user.id:
+        # No snapshot (expired/unknown) or not the owner — don't reveal which.
+        raise HTTPException(status_code=404, detail="artifact not found")
+    path = artifacts.output_file(thread_id, step_id, filename)
+    if path is None:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    return FileResponse(
+        path=str(path), media_type=mime_for(filename), filename=filename,
+        content_disposition_type="attachment",
     )
 
 
@@ -479,6 +505,37 @@ def _update_turn_gate(thread_id: str, **fields) -> None:
                 continue
             pa.update({k: v for k, v in fields.items() if v is not None})
             turn.proposed_action = json.dumps(pa)
+            sdb.commit()
+            break
+    except Exception:
+        sdb.rollback()
+    finally:
+        sdb.close()
+
+
+def _update_turn_question(thread_id: str, answer: str) -> None:
+    """Record the user's answer onto the turn that carries this run's question (matched by
+    the thread_id folded into cot), so a reloaded conversation shows the resolved Q&A
+    instead of an open question."""
+    from core.database import SessionLocal
+
+    sdb = SessionLocal()
+    try:
+        for turn in (
+            sdb.query(AgentTurn)
+            .filter(AgentTurn.agent_trace.like(f"%{thread_id}%"))
+            .all()
+        ):
+            try:
+                cot = json.loads(turn.agent_trace) if turn.agent_trace else None
+            except Exception:
+                cot = None
+            if not (isinstance(cot, dict) and cot.get("thread_id") == thread_id
+                    and isinstance(cot.get("question"), dict)):
+                continue
+            cot["question"]["status"] = "answered"
+            cot["question"]["answer"] = answer
+            turn.agent_trace = json.dumps(cot)
             sdb.commit()
             break
     except Exception:

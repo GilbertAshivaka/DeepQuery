@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import * as agentService from '../services/agentService';
+import { toastError } from './toastStore';
 
 // A fresh assistant turn — the live scaffold the SSE events fill in.
 const newAssistantTurn = () => ({
@@ -17,6 +18,11 @@ const newAssistantTurn = () => ({
   batch: null,         // multi-action gate (batch_approval_required): {items:[…]}
   question: null,      // agent's question (question event): {text, context, status}
   skills: [],          // loaded playbooks (skill_loaded): [{name, version}]
+  // Produced documents (deliverable): [{filename, mime, size, download_url, stepId}]
+  deliverables: [],
+  // Generated build scripts (produce_script_*): [{stepId, code, streaming}] —
+  // stream inline, then collapse to a script.py pill that opens the code panel.
+  scripts: [],
   proposedAction: null,
   intent: null,
   grounded: null,
@@ -26,6 +32,16 @@ const newAssistantTurn = () => ({
 
 // Map a terminal action status onto the plan's awaiting-approval step.
 const PLAN_FOR = { executed: 'done', rejected: 'rejected', failed: 'failed', blocked: 'failed' };
+
+// Events that mark a boundary between distinct answer blocks. The controller streams
+// several answer segments per run (narration → report → post-question answer); when a
+// new block resumes after one of these, we insert a paragraph break so the answer
+// doesn't render jammed together (the blocks arrive as separate answer_token runs).
+const ANSWER_BREAKERS = new Set([
+  'step_status', 'reasoning', 'tool_activity', 'action_result', 'verification_result',
+  'citations', 'skill_loaded', 'approval_required', 'batch_approval_required', 'question',
+  'deliverable', 'produce_script_end',
+]);
 
 // LocalStorage key for the in-flight run (Tier 2 reconnect).
 const LIVE_RUN_KEY = 'deepquery.agent.liveRun';
@@ -58,6 +74,10 @@ export const useAgentStore = create((set, get) => {
   // assistant turn identified by `turnId` so a resumed continuation streams into the
   // same message that's awaiting approval/answer.
   const applyEvent = (turnId, event) => {
+    // Arm a paragraph break: the next answer block starts a new segment.
+    if (ANSWER_BREAKERS.has(event.type)) {
+      patchTurn(turnId, (t) => { if (t.content) t._answerBreak = true; });
+    }
     switch (event.type) {
       case 'run_started':
         patchTurn(turnId, (t) => { t.threadId = event.thread_id || t.threadId; });
@@ -102,7 +122,11 @@ export const useAgentStore = create((set, get) => {
         break;
 
       case 'answer_token':
-        patchTurn(turnId, (t) => { t.content += event.content || ''; });
+        patchTurn(turnId, (t) => {
+          if (t._answerBreak && t.content && !t.content.endsWith('\n')) t.content += '\n\n';
+          t._answerBreak = false;
+          t.content += event.content || '';
+        });
         break;
 
       case 'verification_result':
@@ -200,6 +224,43 @@ export const useAgentStore = create((set, get) => {
         });
         break;
 
+      case 'deliverable':
+        // A produced document is ready for download.
+        patchTurn(turnId, (t) => {
+          if (!t.deliverables.some((d) => d.download_url === event.download_url)) {
+            t.deliverables = [...t.deliverables, {
+              filename: event.filename, mime: event.mime, size: event.size,
+              download_url: event.download_url, stepId: event.step_id,
+            }];
+          }
+        });
+        break;
+
+      case 'produce_script_start':
+        // Open (or reset, on a repair attempt) the inline streaming code card for this step.
+        patchTurn(turnId, (t) => {
+          const exists = t.scripts.some((s) => s.stepId === event.step_id);
+          t.scripts = exists
+            ? t.scripts.map((s) => (s.stepId === event.step_id ? { ...s, code: '', streaming: true } : s))
+            : [...t.scripts, { stepId: event.step_id, code: '', streaming: true }];
+        });
+        break;
+
+      case 'produce_script_delta':
+        patchTurn(turnId, (t) => {
+          t.scripts = t.scripts.map((s) =>
+            s.stepId === event.step_id ? { ...s, code: s.code + (event.content || '') } : s);
+        });
+        break;
+
+      case 'produce_script_end':
+        // Streaming done → swap in the cleaned script and collapse to a script.py pill.
+        patchTurn(turnId, (t) => {
+          t.scripts = t.scripts.map((s) =>
+            s.stepId === event.step_id ? { ...s, code: event.code || s.code, streaming: false } : s);
+        });
+        break;
+
       case 'done':
         patchTurn(turnId, (t) => {
           if (event.answer && !t.content) t.content = event.answer;
@@ -215,10 +276,10 @@ export const useAgentStore = create((set, get) => {
         break;
 
       case 'error':
-        patchTurn(turnId, (t) => {
-          t.isError = true;
-          if (!t.content) t.content = `Something went wrong: ${event.message}`;
-        });
+        // Surface as an ephemeral toast (not a permanent in-thread message). Any partial
+        // answer already streamed stays. Only flag the turn if it produced nothing.
+        toastError(event.message || 'The agent hit an error.', 'Agent error');
+        patchTurn(turnId, (t) => { if (!t.content) t.isError = true; });
         break;
 
       default:
@@ -295,8 +356,36 @@ export const useAgentStore = create((set, get) => {
                 ...(t.proposed_action.resolved_error ? { error: t.proposed_action.resolved_error } : {}),
               }
             : null,
-          threadId: t.proposed_action?.thread_id || null,
+          threadId: t.proposed_action?.thread_id || t.cot?.thread_id || null,
+          // Controller surfaces folded into cot — rehydrated as read-only records (a
+          // still-live run gets overlaid with the actionable version by reattachLiveRun).
+          skills: t.cot?.skills || [],
+          question: t.cot?.question
+            ? { ...t.cot.question, record: true }
+            : null,
+          batch: t.cot?.batch
+            ? {
+                thread_id: t.cot.thread_id,
+                status: 'record',
+                record: true,
+                items: (t.cot.batch.batch || t.cot.batch.items || []).map((a) => ({
+                  pending_id: a.pending_id, connector: a.connector, capability: a.capability,
+                  preview: a.preview, summary: a.summary || '', target: a.target || '',
+                  reasoning: a.reasoning || '', preview_status: a.preview_status || 'resolved',
+                  sources: a.sources || [], decision: 'approve', status: a.status || 'pending',
+                })),
+              }
+            : null,
           attachments: t.attachments || [],
+          // Produced documents persist as document-kind attachments on the assistant
+          // turn → rehydrate as download cards (durable /attachments/{id}/content URL).
+          deliverables: t.role === 'assistant'
+            ? (t.attachments || [])
+                .filter((a) => a.kind === 'document' && a.id)
+                .map((a) => ({ filename: a.filename, download_url: `/api/agents/attachments/${a.id}/content` }))
+            : [],
+          // The build script(s) rehydrate as script.py pills (no longer streaming).
+          scripts: (t.cot?.scripts || []).map((s) => ({ stepId: s.step_id, code: s.code, streaming: false })),
           created_at: t.created_at,
         }));
         set({ turns: loaded, isLoadingTurns: false });
@@ -341,10 +430,8 @@ export const useAgentStore = create((set, get) => {
           get().loadConversations();
         },
         (err) => {
-          patchTurn(assistantTurn.id, (t) => {
-            t.isError = true;
-            if (!t.content) t.content = `Something went wrong: ${err.message}`;
-          });
+          toastError(err.message || 'The run could not complete.', 'Agent error');
+          patchTurn(assistantTurn.id, (t) => { if (!t.content) t.isError = true; });
           set({ isStreaming: false, isStopping: false, streamController: null });
         }
       );
@@ -386,9 +473,15 @@ export const useAgentStore = create((set, get) => {
           get().loadConversations();
         },
         (err) => {
+          toastError(err.message || 'Could not resume the run.', 'Agent error');
+          // Roll the gate back to actionable so the user can retry, rather than stranding
+          // it mid-approve.
           patchTurn(turnId, (t) => {
             if (t.approval && t.approval.status === 'approving') {
-              t.approval = { ...t.approval, status: 'failed', error: err.message };
+              t.approval = { ...t.approval, status: 'pending' };
+            }
+            if (t.batch && t.batch.status === 'approving') {
+              t.batch = { ...t.batch, status: 'pending', items: t.batch.items.map((it) => ({ ...it, status: 'pending' })) };
             }
           });
           set({ isStreaming: false, streamController: null });
@@ -507,6 +600,7 @@ export const useAgentStore = create((set, get) => {
         ...newAssistantTurn(),
         id: `live-${live.threadId}`,
         threadId: live.threadId,
+        runInterrupted: status === 'interrupted',
         plan: snap.plan || [],
         trace: (snap.trace || []).filter((e) => e.kind !== 'skill'),
         content: snap.answer || '',
@@ -515,6 +609,8 @@ export const useAgentStore = create((set, get) => {
         intent: snap.intent,
         grounded: snap.grounded,
         skills: (snap.trace || []).filter((e) => e.kind === 'skill').map((e) => ({ name: e.name, version: e.version })),
+        deliverables: snap.deliverables || [],
+        scripts: (snap.scripts || []).map((s) => ({ stepId: s.step_id, code: s.code || '', streaming: !!s.streaming })),
         approval: pa && !isBatch ? {
           thread_id: snap.thread_id, pending_id: pa.pending_id, connector: pa.connector,
           capability: pa.capability, preview: pa.preview, reasoning: pa.reasoning,
@@ -536,12 +632,14 @@ export const useAgentStore = create((set, get) => {
         } : null,
       };
 
-      // Target an existing turn (DB-rehydrated, or a prior reattach) when present;
-      // otherwise add the freshly-built one.
+      // Reconcile with what's on screen. If a turn for this run already exists (a prior
+      // reattach, or the read-only record rehydrated from the DB), replace it in place
+      // with the live, actionable version (record:false) — keeping its id, not duplicating.
       const turnId = existing ? existing.id : turn.id;
-      if (!existing) {
-        set((s) => ({ turns: [...s.turns, turn] }));
-      }
+      set((s) => {
+        if (!existing) return { turns: [...s.turns, turn] };
+        return { turns: s.turns.map((t) => (t.id === existing.id ? { ...turn, id: existing.id } : t)) };
+      });
 
       if (status === 'interrupted') {
         // The run died in a server restart — show the partial result, no live feed.
