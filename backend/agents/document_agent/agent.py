@@ -174,6 +174,13 @@ def _reopen_error(p: Path) -> str:
                 logger.warning("python-docx not installed in backend — skipping docx re-open check")
                 return ""
             docx.Document(str(p))
+        elif ext == ".pptx":
+            try:
+                import pptx
+            except ImportError:
+                logger.warning("python-pptx not installed in backend — skipping pptx re-open check")
+                return ""
+            pptx.Presentation(str(p))
         elif ext == ".pdf":
             with open(p, "rb") as fh:
                 if fh.read(5) != b"%PDF-":

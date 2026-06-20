@@ -55,6 +55,9 @@ class RetrievalAgent:
         want_documents: bool = True,
         want_live: bool = False,
         want_whole_doc: bool = False,
+        whole_doc_min_chunks: int = 2,
+        whole_doc_max_docs: int = 1,
+        whole_doc_max_chars: int = 12000,
         attachments: Optional[list[dict]] = None,
     ) -> dict[str, Any]:
         """Gather grounded context for a query.
@@ -132,22 +135,26 @@ class RetrievalAgent:
             from collections import Counter
             ids = [c.get("document_id") for c in context_chunks if c.get("document_id")]
             if ids:
-                top_id, count = Counter(ids).most_common(1)[0]
-                # Expand when at least 2 retrieved chunks come from the same document
-                # (signals the query is centred on it). Token-capped, so cost is bounded.
-                if top_id and count >= 2:
-                    loop = asyncio.get_event_loop()
+                loop = asyncio.get_event_loop()
+                # Expand the most-concentrated documents: each must contribute at least
+                # `whole_doc_min_chunks` retrieved chunks (signals the query is centred on
+                # it); pull up to `whole_doc_max_docs` of them, each length-capped.
+                for top_id, count in Counter(ids).most_common(max(1, whole_doc_max_docs)):
+                    if not top_id or count < max(1, whole_doc_min_chunks):
+                        continue
                     title, text = await loop.run_in_executor(None, _extract_whole_doc, top_id)
-                    if text:
-                        n = len([w for w in whole_documents]) + 1
-                        whole_documents.append({"document_id": top_id, "title": title, "text": text})
-                        citations.append({
-                            "source_type": "document_full", "doc_number": n,
-                            "document_name": title, "document_id": top_id,
-                        })
-                        tool_activity.append({
-                            "tool": "document_expand", "detail": f"loaded full text of '{title}'", "status": "ok",
-                        })
+                    if not text:
+                        continue
+                    text = text[:max(1, whole_doc_max_chars)]  # per-doc page cap (token-guarded)
+                    n = len(whole_documents) + 1
+                    whole_documents.append({"document_id": top_id, "title": title, "text": text})
+                    citations.append({
+                        "source_type": "document_full", "doc_number": n,
+                        "document_name": title, "document_id": top_id,
+                    })
+                    tool_activity.append({
+                        "tool": "document_expand", "detail": f"loaded full text of '{title}'", "status": "ok",
+                    })
 
         # ── User-attached documents ── (this-turn context, parsed text)
         attachment_ctx: list[dict] = []

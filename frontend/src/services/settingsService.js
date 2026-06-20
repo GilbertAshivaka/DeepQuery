@@ -20,6 +20,17 @@ export async function changePassword(currentPassword, newPassword) {
   return data;
 }
 
+// ── Agent retrieval preferences (per-user, self-service) ─────────
+export async function getAgentPrefs() {
+  const { data } = await api.get('/api/agents/preferences');
+  return data; // { prefs, bounds, defaults, page_chars }
+}
+
+export async function setAgentPrefs(patch) {
+  const { data } = await api.put('/api/agents/preferences', patch);
+  return data; // updated { prefs, bounds, defaults, page_chars }
+}
+
 // ── Model config (admin) ─────────────────────────────────────────
 export async function getModelConfig() {
   const { data } = await api.get('/api/admin/model-config');

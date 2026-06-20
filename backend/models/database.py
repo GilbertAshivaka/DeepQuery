@@ -47,6 +47,9 @@ class User(Base):
     full_name = Column(String(255), nullable=False)
     role = Column(Enum(UserRole), nullable=False, default=UserRole.STUDENT)
     is_active = Column(Boolean, default=True)
+    # Per-user preferences (JSON). Holds the agent retrieval knobs (parallel reads,
+    # whole-doc expansion); see agents/user_prefs.py. Nullable → deployment defaults apply.
+    preferences_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 

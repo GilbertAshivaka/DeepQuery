@@ -257,8 +257,18 @@ class Settings(BaseSettings):
     agent_controller_compaction_threshold: int = 60000
     agent_controller_compaction_keep_recent: int = 8   # raw chunks kept un-compacted
     # Parallel map-reduce reads (spec §2.7): a read step may fan out into this many
-    # concurrent sub-reads, each distilled then merged.
-    agent_max_parallel_reads: int = 5
+    # concurrent sub-reads, each distilled then merged. This is the DEPLOYMENT DEFAULT;
+    # each user can override it (1–5) in their Settings → Agent (see agents/user_prefs.py).
+    agent_max_parallel_reads: int = 2
+    # Whole-document expansion in the agent retrieval path — deployment defaults, each
+    # per-user overridable in Settings → Agent (bounds in agents/user_prefs.py):
+    #   min_chunks : ≥ this many chunks from one doc before its full text is pulled (2–5)
+    #   max_docs   : how many distinct documents may be expanded in one read (1–5)
+    #   max_pages  : per-document length cap, in pages (2–30); chars = pages × page_chars
+    agent_whole_doc_min_chunks: int = 2
+    agent_whole_doc_max_docs: int = 1
+    agent_whole_doc_max_pages: int = 10
+    agent_whole_doc_page_chars: int = 3000   # pages→chars conversion (~750 tokens/page)
     # Per-connector concurrency cap (spec §2.7/§6): bounds simultaneous live calls to one
     # connector so a wide fan-out can't trip provider rate limits.
     agent_connector_max_concurrency: int = 3
@@ -278,7 +288,7 @@ class Settings(BaseSettings):
     agent_sandbox_runtime: str = "docker"
     # Prebaked toolchain image (built from backend/sandbox/Dockerfile). Pinned tag;
     # recorded in telemetry. Bump deliberately when the dep set changes.
-    agent_sandbox_image: str = "deepquery-doctools:0.1"
+    agent_sandbox_image: str = "deepquery-doctools:0.2"
     # Hard per-run resource limits (the blast-radius caps from §3.2).
     agent_sandbox_timeout_s: int = 120
     agent_sandbox_memory: str = "1g"

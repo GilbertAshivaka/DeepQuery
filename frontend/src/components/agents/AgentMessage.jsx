@@ -3,7 +3,7 @@ import { motion } from 'framer-motion';
 import {
   AlertCircle, Copy, Check, ShieldQuestion, Loader2, FileText, Image as ImageIcon,
   CheckCircle2, XCircle, AlertTriangle, Sparkles, HelpCircle, Send, Link2, RefreshCw,
-  FileCode2, FileSpreadsheet, Download,
+  FileCode2, FileSpreadsheet, Download, Presentation,
 } from 'lucide-react';
 import SelfCorrectionBadge from '../chat/SelfCorrectionBadge';
 import PlanChecklist from './PlanChecklist';
@@ -243,6 +243,7 @@ function StreamingScriptCard({ code }) {
 function deliverableIcon(filename) {
   const ext = (filename || '').toLowerCase().split('.').pop();
   if (ext === 'xlsx' || ext === 'csv') return FileSpreadsheet;
+  if (ext === 'pptx') return Presentation;
   return FileText;
 }
 

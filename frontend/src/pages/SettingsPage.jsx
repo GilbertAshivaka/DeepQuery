@@ -9,9 +9,11 @@ import {
   KeyRound,
   Layers,
   ChevronLeft,
+  SlidersHorizontal,
 } from 'lucide-react';
 import AccountSection from '../components/settings/AccountSection';
 import AppearanceSection from '../components/settings/AppearanceSection';
+import AgentSection from '../components/settings/AgentSection';
 import ModelsSection from '../components/settings/ModelsSection';
 import ApiKeysSection from '../components/settings/ApiKeysSection';
 import EmbeddingsSection from '../components/settings/EmbeddingsSection';
@@ -19,6 +21,7 @@ import EmbeddingsSection from '../components/settings/EmbeddingsSection';
 const SECTIONS = [
   { id: 'account', label: 'Account', icon: User, group: 'Account', Component: AccountSection },
   { id: 'appearance', label: 'Appearance', icon: Palette, group: 'Account', Component: AppearanceSection },
+  { id: 'agent', label: 'Agent', icon: SlidersHorizontal, group: 'Account', Component: AgentSection },
   { id: 'models', label: 'Models & Providers', icon: Cpu, group: 'Administration', admin: true, Component: ModelsSection },
   { id: 'keys', label: 'API Keys', icon: KeyRound, group: 'Administration', admin: true, Component: ApiKeysSection },
   { id: 'embeddings', label: 'Embeddings', icon: Layers, group: 'Administration', admin: true, Component: EmbeddingsSection },

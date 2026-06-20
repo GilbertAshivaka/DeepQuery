@@ -23,6 +23,34 @@ export const useSettingsStore = create(
       setAppearance: (patch) =>
         set((s) => ({ appearance: { ...s.appearance, ...patch } })),
 
+      // ── Agent retrieval prefs (per-user, server-side; not persisted locally) ──
+      agentPrefs: null, // { prefs, bounds, defaults, page_chars }
+      loadAgentPrefs: async () => {
+        try {
+          const data = await settingsService.getAgentPrefs();
+          set({ agentPrefs: data });
+        } catch (err) {
+          toastError(
+            err?.response?.data?.detail || 'Failed to load agent preferences.',
+            'Settings'
+          );
+        }
+      },
+      saveAgentPrefs: async (patch) => {
+        try {
+          const data = await settingsService.setAgentPrefs(patch);
+          set({ agentPrefs: data });
+          toastSuccess('Agent preferences saved.', 'Settings');
+          return true;
+        } catch (err) {
+          toastError(
+            err?.response?.data?.detail || 'Failed to save agent preferences.',
+            'Settings'
+          );
+          return false;
+        }
+      },
+
       // ── Server config (not persisted) ──
       modelConfig: null, // GET /model-config payload
       thinking: null, // GET /model-config/thinking payload

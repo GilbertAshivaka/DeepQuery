@@ -28,6 +28,7 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
+from agents import user_prefs
 from agents.models import Slot, get_model
 from agents.models.reasoning import extract_reasoning_delta, extract_text_delta
 from agents.orchestrator import artifacts
@@ -277,6 +278,8 @@ async def hydrate_node(state: _g.AgentState) -> dict:
     # Skills (spec §2.10): the index the controller plans with, + any explicitly-selected
     # playbooks loaded up front as run-level instructions (both entry paths).
     skill_index = await asyncio.to_thread(_skills.get_skill_index)
+    # Per-user retrieval knobs (parallel reads, whole-doc expansion) — clamped to bounds.
+    prefs = await asyncio.to_thread(user_prefs.resolve_for_run, user_id)
     loaded_skills: list[dict] = []
     findings: list[str] = []
     for name in (state.get("skill_names") or []):
@@ -293,6 +296,7 @@ async def hydrate_node(state: _g.AgentState) -> dict:
         "findings": findings, "loop_count": 0, "answered": False, "plan": [],
         "has_documents": has_documents, "has_live": has_live, "has_action": has_action,
         "has_produce": has_produce, "connector_catalog": connector_catalog,
+        "agent_prefs": prefs,
         "skill_index": skill_index, "loaded_skills": loaded_skills, "failed_tools": [],
         "context_chunks": [], "live_records": [], "whole_documents": [],
         "citations": [], "graph_context": "", "deliverables": [], "produce_attempts": 0,
@@ -369,6 +373,9 @@ async def controller_node(state: _g.AgentState) -> dict:
         f"User request:\n{state.get('query', '')}\n\n"
         f"Sources available: documents={state.get('has_documents')}, live_tools={state.get('has_live')}, "
         f"action_tools={state.get('has_action')}, document_builder={state.get('has_produce')}\n"
+        f"Parallel-read budget: at most {(state.get('agent_prefs') or {}).get('max_parallel_reads', 2)} "
+        f"sub-queries in one read step — only fan out when the request truly needs distinct lookups; "
+        f"a single focused read is usually best.\n"
         f"{_connectors_block(state)}"
         f"{_attachments_block(state)}"
         f"{failed_block}"
@@ -469,11 +476,15 @@ async def _gather_one(state: _g.AgentState, spec, query: str, sources: dict) -> 
     ww = bool(sources.get("whole_doc"))
     if not (wd or wl):  # nothing usable asked for → safe corpus lookup
         wd = bool(state.get("has_documents"))
+    prefs = state.get("agent_prefs") or user_prefs.defaults()
     res = await spec.handler.gather(
         query=query, allowed_collections=state.get("allowed_collections", []),
         chat_history=state.get("chat_history"), user_id=state.get("user_id", ""),
         conversation_id=state.get("conversation_id"), want_documents=wd, want_live=wl,
         want_whole_doc=ww, attachments=state.get("attachments"),
+        whole_doc_min_chunks=prefs.get("whole_doc_min_chunks", 2),
+        whole_doc_max_docs=prefs.get("whole_doc_max_docs", 1),
+        whole_doc_max_chars=user_prefs.whole_doc_max_chars(prefs),
     )
     return query, wd, wl, res
 
@@ -488,10 +499,12 @@ async def read_node(state: _g.AgentState) -> dict:
     spec = get_subagent(Capability.RETRIEVAL)
     step_id = decision.get("_step_id") or f"step-{state.get('loop_count')}"
 
+    max_parallel = (state.get("agent_prefs") or {}).get(
+        "max_parallel_reads", settings.agent_max_parallel_reads)
     queries = decision.get("queries")
     if isinstance(queries, list) and len(queries) > 1:
         subs = [(str(q.get("query") or state["query"]), q.get("sources") or {})
-                for q in queries if isinstance(q, dict)][:max(1, settings.agent_max_parallel_reads)]
+                for q in queries if isinstance(q, dict)][:max(1, max_parallel)]
     else:
         subs = [(state["query"], decision.get("sources") or {})]
 

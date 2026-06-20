@@ -185,6 +185,7 @@ class AgentState(TypedDict, total=False):
     connector_catalog: list[dict]  # enabled connectors [{connector, summary}] — controller visibility
     has_action: bool             # action tools available + durable (act decision enabled)
     has_produce: bool            # document sandbox available this run (produce enabled)
+    agent_prefs: dict            # per-user retrieval knobs (parallel reads, whole-doc) — user_prefs
     # Document generation (DOCUMENT_GENERATION_SANDBOX_GUIDE)
     deliverables: list[dict]     # produced docs [{artifact_id,filename,mime,size,download_url}]
     produce_attempts: int        # total sandbox attempts across produce steps this run

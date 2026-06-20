@@ -273,6 +273,44 @@ async def download_artifact(
     )
 
 
+# ── Per-user agent preferences (retrieval knobs) ─────────────
+class AgentPrefsUpdate(BaseModel):
+    max_parallel_reads: Optional[int] = None
+    whole_doc_min_chunks: Optional[int] = None
+    whole_doc_max_docs: Optional[int] = None
+    whole_doc_max_pages: Optional[int] = None
+
+
+def _prefs_payload(db: Session, user_id: str) -> dict:
+    from agents import user_prefs
+    return {
+        "prefs": user_prefs.get(db, user_id),
+        "bounds": user_prefs.BOUNDS,
+        "defaults": user_prefs.defaults(),
+        "page_chars": settings.agent_whole_doc_page_chars,
+    }
+
+
+@router.get("/preferences")
+def get_agent_preferences(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """The user's effective agent retrieval knobs, with the allowed [min,max] bounds and
+    deployment defaults (so the Settings UI can render sliders with the right ranges)."""
+    return _prefs_payload(db, user.id)
+
+
+@router.put("/preferences")
+def update_agent_preferences(
+    body: AgentPrefsUpdate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Update some/all knobs (values are clamped to bounds server-side) and return the
+    effective prefs + bounds."""
+    from agents import user_prefs
+    user_prefs.update(db, user.id, body.model_dump(exclude_none=True))
+    return _prefs_payload(db, user.id)
+
+
 # ── Conversation history (memory) ────────────────────────────
 @router.get("/conversations")
 def list_conversations(user: User = Depends(get_current_user), db: Session = Depends(get_db)):

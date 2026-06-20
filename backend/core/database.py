@@ -87,6 +87,7 @@ def init_db():
         _add_column_if_missing("agent_turns", "agent_trace", "TEXT")
         _add_column_if_missing("connectors", "summary", "TEXT")
         _add_column_if_missing("connectors", "icon_url", "TEXT")
+        _add_column_if_missing("users", "preferences_json", "TEXT")
 
 
 def _add_column_if_missing(table: str, column: str, ddl_type: str):
