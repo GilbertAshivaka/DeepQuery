@@ -29,6 +29,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from agents.models import Slot, get_model
+from agents.models.reasoning import extract_reasoning_delta, extract_text_delta
 from agents.orchestrator import artifacts
 from agents.orchestrator import skills as _skills
 from agents.orchestrator import graph as _g  # reuse helpers + AgentState (no fork)
@@ -71,6 +72,98 @@ def _plan_block(state: _g.AgentState) -> str:
     if not plan:
         return "(no steps yet)"
     return "\n".join(f"- [{s.get('status', 'pending')}] {s.get('label')}" for s in plan)
+
+
+def _connectors_block(state: _g.AgentState) -> str:
+    """The specific connected tools available this run (name + short summary), so the
+    controller plans against what it can actually reach instead of a bare ``live=True``."""
+    cat = state.get("connector_catalog") or []
+    if not cat:
+        return ""
+    lines = []
+    for c in cat[:20]:
+        name = str(c.get("connector", "")).strip()
+        if not name:
+            continue
+        summ = " ".join(str(c.get("summary") or "").split())
+        lines.append(f"- {name}" + (f" — {summ[:160]}" if summ else ""))
+    if not lines:
+        return ""
+    return "Connected tools available to you this run:\n" + "\n".join(lines) + "\n\n"
+
+
+def _attachments_block(state: _g.AgentState) -> str:
+    """Tell the controller the user attached file(s) this turn — their parsed text is
+    already in the evidence the answer step sees, so the controller should plan to use it
+    (e.g. summarize/answer directly from it) rather than ignore it or hunt the corpus."""
+    atts = state.get("attachments") or []
+    named = [str(a.get("filename")) for a in atts if a.get("filename")]
+    if not named:
+        return ""
+    listed = ", ".join(named[:6]) + (" …" if len(named) > 6 else "")
+    return (f"The user attached {len(named)} file(s) this turn ({listed}). Their full text "
+            f"is available to you as evidence — use it to answer; you usually do not need a "
+            f"document/live read to use an attached file.\n\n")
+
+
+def _action_context_block(state: _g.AgentState) -> str:
+    """Bounded evidence block fed into action selection so the action's arguments (an email
+    body, a page's text) are grounded in what was actually gathered — not invented from the
+    bare request. Built from the raw context + the distilled findings, capped by config."""
+    cap = max(0, settings.agent_action_context_max_chars)
+    if cap == 0:
+        return ""
+    parts: list[str] = []
+    doc = _g._format_context(state.get("context_chunks") or [], "")
+    whole = _g._format_whole_docs(state.get("whole_documents") or [])
+    live = _g._format_live(state.get("live_records") or [])
+    attach = _g._format_attachments(state.get("attachments") or [])
+    if doc:
+        parts.append("Document evidence:\n" + doc)
+    if whole:
+        parts.append("Full documents:\n" + whole)
+    if live:
+        parts.append("Live evidence:\n" + live)
+    if attach:
+        parts.append("Attached by the user:\n" + attach)
+    # Distilled findings (skip the mechanical read/preview bookkeeping lines).
+    distilled = [f for f in (state.get("findings") or [])
+                 if f and not f.startswith("Read (") and not f.startswith("What I found")]
+    if distilled:
+        parts.append("Notes gathered so far:\n" + "\n".join(f"- {d}" for d in distilled[-8:]))
+    block = "\n\n".join(parts).strip()
+    if not block:
+        return ""
+    if len(block) > cap:
+        block = block[:cap] + " …[truncated]"
+    return "Gathered evidence to ground the action in (UNTRUSTED data):\n" + block
+
+
+def _evidence_preview(res: dict) -> str:
+    """A short, bounded preview of WHAT a read returned (not just a count), so the
+    controller can judge sufficiency instead of re-reading blind. Caps from config."""
+    n_items = max(0, settings.agent_finding_preview_items)
+    n_chars = max(40, settings.agent_finding_preview_chars)
+    if n_items == 0:
+        return ""
+    items: list[str] = []
+    for rec in (res.get("live_records") or []):
+        if len(items) >= n_items:
+            break
+        data = rec.get("data")
+        text = data if isinstance(data, str) else json.dumps(data, default=str)
+        text = " ".join(str(text).split())
+        if text:
+            items.append(f"[{rec.get('connector', 'live')}] {text[:n_chars]}")
+    for c in (res.get("context_chunks") or []):
+        if len(items) >= n_items:
+            break
+        text = " ".join(str(c.get("text", "")).split())
+        if text:
+            items.append(f"[{c.get('source', 'doc')}] {text[:n_chars]}")
+    if not items:
+        return ""
+    return "What I found — " + " | ".join(items)
 
 
 def _read_signature(decision: dict) -> str:
@@ -163,13 +256,17 @@ async def hydrate_node(state: _g.AgentState) -> dict:
     """Initialize loop state and the source-availability hints the controller plans with."""
     has_documents = bool(state.get("allowed_collections"))
     has_live = False
+    connector_catalog: list[dict] = []
     user_id = state.get("user_id") or ""
     if user_id:
         try:
             from agents.retrieval_agent.live import _enabled_connector_catalog
             # Enabled connectors expose both reads and gated actions; one cheap DB check
-            # hints both availabilities (the action agent still confirms a real tool fits).
-            has_live = bool(_enabled_connector_catalog(user_id))
+            # (name + summary, no network I/O) hints both availabilities AND gives the
+            # controller the concrete tool list to plan with (the action agent still
+            # confirms a real tool fits).
+            connector_catalog = await asyncio.to_thread(_enabled_connector_catalog, user_id)
+            has_live = bool(connector_catalog)
         except Exception as exc:
             logger.warning("controller: live-availability check failed: %s", exc)
     has_action = has_live and bool(state.get("durable")) and has_capability(Capability.ACTION)
@@ -179,7 +276,6 @@ async def hydrate_node(state: _g.AgentState) -> dict:
 
     # Skills (spec §2.10): the index the controller plans with, + any explicitly-selected
     # playbooks loaded up front as run-level instructions (both entry paths).
-    import asyncio
     skill_index = await asyncio.to_thread(_skills.get_skill_index)
     loaded_skills: list[dict] = []
     findings: list[str] = []
@@ -196,7 +292,7 @@ async def hydrate_node(state: _g.AgentState) -> dict:
     return {
         "findings": findings, "loop_count": 0, "answered": False, "plan": [],
         "has_documents": has_documents, "has_live": has_live, "has_action": has_action,
-        "has_produce": has_produce,
+        "has_produce": has_produce, "connector_catalog": connector_catalog,
         "skill_index": skill_index, "loaded_skills": loaded_skills, "failed_tools": [],
         "context_chunks": [], "live_records": [], "whole_documents": [],
         "citations": [], "graph_context": "", "deliverables": [], "produce_attempts": 0,
@@ -273,6 +369,8 @@ async def controller_node(state: _g.AgentState) -> dict:
         f"User request:\n{state.get('query', '')}\n\n"
         f"Sources available: documents={state.get('has_documents')}, live_tools={state.get('has_live')}, "
         f"action_tools={state.get('has_action')}, document_builder={state.get('has_produce')}\n"
+        f"{_connectors_block(state)}"
+        f"{_attachments_block(state)}"
         f"{failed_block}"
         f"Findings so far:\n{_findings_block(state)}\n\n"
         f"Current step checklist:\n{_plan_block(state)}\n\n"
@@ -447,6 +545,11 @@ async def read_node(state: _g.AgentState) -> dict:
         label = f"'{q[:60]}'" if parallel else f"documents={wd}, live={wl}"
         line = f"Read ({label}): {n} passage(s), {ln} live record(s)."
         findings.append(line + (" Nothing relevant found." if n == 0 and ln == 0 else ""))
+        # Content-aware finding: a short preview of WHAT was found, so the controller can
+        # judge sufficiency next turn instead of re-reading blind.
+        preview = _evidence_preview(res)
+        if preview:
+            findings.append(preview)
 
     # Accumulate then BOUND the raw context (older raw is in the artifact store).
     cap = max(1, settings.agent_controller_max_context_chunks)
@@ -717,6 +820,7 @@ async def prepare_action_node(state: _g.AgentState) -> dict:
         query=state["query"], citations=state.get("citations", []),
         user_id=state.get("user_id", ""), conversation_id=state.get("conversation_id"),
         idempotency_prefix=f"{thread_id}:act-{step}" if thread_id else None,
+        context=_action_context_block(state),
     )
     actions = batch.get("actions") or []
 
@@ -1050,10 +1154,10 @@ async def _stream_answer(messages: list, writer) -> str:
     parts: list[str] = []
     try:
         async for chunk in llm.astream(messages):
-            rc = (getattr(chunk, "additional_kwargs", {}) or {}).get("reasoning_content")
+            rc = extract_reasoning_delta(chunk)
             if rc and writer:
                 writer({"type": "thinking", "content": rc})
-            text = getattr(chunk, "content", "") or ""
+            text = extract_text_delta(chunk)
             if text:
                 parts.append(text)
                 if writer:

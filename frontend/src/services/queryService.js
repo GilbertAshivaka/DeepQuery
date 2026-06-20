@@ -4,12 +4,15 @@ import api from './api';
  * Stream a chat response via SSE.
  * Returns an AbortController so caller can cancel.
  */
-export function streamChat(query, conversationId, onChunk, onDone, onError) {
+export function streamChat(query, conversationId, onChunk, onDone, onError, attachmentIds) {
   const controller = new AbortController();
 
   const body = { query };
   if (conversationId) {
     body.conversation_id = conversationId;
+  }
+  if (attachmentIds?.length) {
+    body.attachment_ids = attachmentIds;
   }
 
   const token = localStorage.getItem('access_token');

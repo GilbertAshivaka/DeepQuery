@@ -21,6 +21,8 @@ import {
   Trash2,
   Network,
   ScatterChart,
+  Settings,
+  ChevronsUpDown,
 } from 'lucide-react';
 
 const navItems = [
@@ -55,13 +57,18 @@ export default function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showHistory, setShowHistory] = useState(false);
   const [menuOpenId, setMenuOpenId] = useState(null);
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
   const menuRef = useRef(null);
+  const userMenuRef = useRef(null);
 
-  // Close menu on click outside
+  // Close menus on click outside
   useEffect(() => {
     const handleClickOutside = (e) => {
       if (menuRef.current && !menuRef.current.contains(e.target)) {
         setMenuOpenId(null);
+      }
+      if (userMenuRef.current && !userMenuRef.current.contains(e.target)) {
+        setUserMenuOpen(false);
       }
     };
     document.addEventListener('mousedown', handleClickOutside);
@@ -308,29 +315,96 @@ export default function Layout() {
 
         {/* User footer */}
         <div className="relative px-3 py-3 border-t border-black/10">
-          <div
-            className={`flex items-center gap-3 ${
-              !sidebarOpen ? 'justify-center' : ''
-            }`}
-          >
-            <div className="flex items-center justify-center w-8 h-8 rounded-full bg-amber-800 text-white text-xs font-bold flex-shrink-0">
-              {user?.username?.[0]?.toUpperCase() || 'U'}
+          <div className={`flex items-center gap-2 ${!sidebarOpen ? 'justify-center' : ''}`}>
+            {/* Account button — opens the popup in both collapsed and expanded modes */}
+            <div ref={userMenuRef} className={`relative ${sidebarOpen ? 'flex-1 min-w-0' : ''}`}>
+              {userMenuOpen && (
+                <div
+                  className="absolute bottom-full left-0 mb-2 z-50 w-56 py-1.5
+                    bg-white rounded-xl border border-cream-200 shadow-warm-lg animate-fade-in"
+                >
+                  {/* Account header */}
+                  <div className="flex items-center gap-3 px-3 py-2">
+                    <div className="flex items-center justify-center w-8 h-8 rounded-full bg-amber-800 text-white text-xs font-bold flex-shrink-0">
+                      {user?.username?.[0]?.toUpperCase() || 'U'}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-ink-900 truncate">
+                        {user?.username}
+                      </p>
+                      <p className="text-[10px] text-ink-600 capitalize">{user?.role}</p>
+                    </div>
+                  </div>
+                  <div className="my-1 border-t border-cream-200" />
+                  <button
+                    onClick={() => {
+                      setUserMenuOpen(false);
+                      navigate('/settings');
+                    }}
+                    className="flex items-center gap-2.5 w-full px-3 py-2 text-sm text-ink-700
+                      hover:bg-cream-50 transition-colors"
+                  >
+                    <Settings size={15} className="text-ink-600" />
+                    Settings
+                  </button>
+                  <div className="my-1 border-t border-cream-200" />
+                  <button
+                    onClick={() => {
+                      setUserMenuOpen(false);
+                      handleLogout();
+                    }}
+                    className="flex items-center gap-2.5 w-full px-3 py-2 text-sm text-terra-500
+                      hover:bg-terra-500/5 transition-colors"
+                  >
+                    <LogOut size={15} />
+                    Log out
+                  </button>
+                </div>
+              )}
+
+              <button
+                onClick={() => setUserMenuOpen((o) => !o)}
+                title={!sidebarOpen ? user?.username : undefined}
+                className={`flex items-center gap-3 rounded-xl transition-all duration-200
+                  ${sidebarOpen ? 'w-full px-2 py-1.5' : 'p-1'}
+                  ${userMenuOpen ? 'bg-white/60 shadow-warm-sm' : 'hover:bg-white/40'}`}
+              >
+                <div className="flex items-center justify-center w-8 h-8 rounded-full bg-amber-800 text-white text-xs font-bold flex-shrink-0">
+                  {user?.username?.[0]?.toUpperCase() || 'U'}
+                </div>
+                {sidebarOpen && (
+                  <>
+                    <div className="flex-1 min-w-0 text-left animate-fade-in">
+                      <p className="text-sm font-medium text-ink-900 truncate">
+                        {user?.username}
+                      </p>
+                      <p className="text-[10px] text-ink-600 capitalize">{user?.role}</p>
+                    </div>
+                    <ChevronsUpDown size={15} className="text-ink-600 flex-shrink-0" />
+                  </>
+                )}
+              </button>
             </div>
+
+            {/* Expanded only: standalone settings + logout icon buttons */}
             {sidebarOpen && (
-              <div className="flex-1 min-w-0 animate-fade-in">
-                <p className="text-sm font-medium text-ink-900 truncate">
-                  {user?.username}
-                </p>
-                <p className="text-[10px] text-ink-600 capitalize">{user?.role}</p>
-              </div>
+              <>
+                <button
+                  onClick={() => navigate('/settings')}
+                  className="p-1.5 rounded-lg text-ink-600 hover:text-violet-500 hover:bg-black/5 transition-all"
+                  title="Settings"
+                >
+                  <Settings size={16} />
+                </button>
+                <button
+                  onClick={handleLogout}
+                  className="p-1.5 rounded-lg text-ink-600 hover:text-terra-500 hover:bg-black/5 transition-all"
+                  title="Logout"
+                >
+                  <LogOut size={16} />
+                </button>
+              </>
             )}
-            <button
-              onClick={handleLogout}
-              className="p-1.5 rounded-lg text-ink-600 hover:text-terra-500 hover:bg-black/5 transition-all"
-              title="Logout"
-            >
-              <LogOut size={16} />
-            </button>
           </div>
         </div>
       </aside>

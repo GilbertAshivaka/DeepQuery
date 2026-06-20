@@ -27,3 +27,5 @@ export const toastError = (message, title) =>
   useToastStore.getState().addToast({ type: 'error', title, message });
 export const toastInfo = (message, title) =>
   useToastStore.getState().addToast({ type: 'info', title, message, duration: 4000 });
+export const toastSuccess = (message, title) =>
+  useToastStore.getState().addToast({ type: 'success', title, message, duration: 4000 });

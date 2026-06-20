@@ -34,8 +34,24 @@ class Settings(BaseSettings):
 
     # ── Google AI (Gemini Embedding 2) ───────────────────────
     google_api_key: str = ""
+    # Embedding provider + model. Gemini Embedding 2 is the default and the
+    # recommended choice; the provider is configurable so deployments can swap it
+    # (requires a re-index — see MODEL_VENDOR_PICKING_PLAN.md §7). The triple
+    # (embedding_provider, embedding_model, embedding_dimensions) forms the
+    # "embedding identity" bound to each Chroma collection.
+    embedding_provider: str = "google"
     embedding_model: str = "gemini-embedding-2-preview"
     embedding_dimensions: int = 3072
+
+    # Active physical suffix for the RBAC collections. Empty = bare logical names
+    # (academic, departmental, …) — the current/legacy layout. A re-index migration
+    # writes into suffixed shadow collections (e.g. academic__v2) and flips this
+    # pointer atomically once verified. Never mutate a live collection in place.
+    embedding_collection_version: str = ""
+    # When True, assert on every Chroma read/write that the active embedding identity
+    # matches the collection's recorded identity (hard error on mismatch). Legacy
+    # collections with no recorded identity pass with a warning (and are backfilled).
+    embedding_identity_guard: bool = True
 
     # ── Groq (Llama 3.3 70B) ────────────────────────────────
     groq_api_key: str = ""
@@ -55,9 +71,53 @@ class Settings(BaseSettings):
     agent_verification_provider: str = "groq"
     agent_verification_model: str = "openai/gpt-oss-120b"
 
+    # ── Classic RAG pipeline — per-workload provider + model ─
+    # The classic user-facing pipeline rides the same provider-agnostic factory as the
+    # agent slots, split into three independently-configurable roles so each workload
+    # can run a different model (e.g. a cheaper/faster model for batch extraction than
+    # for chat). All default to Groq Llama 3.3 70B, preserving current behavior exactly.
+    # (llm_model above is retained for reference/back-compat.)
+    #   chat            → RAG answer generation
+    #   self_correction → answer verification / correction
+    #   extraction      → entity extraction, metadata generation, query-entity extraction
+    agent_chat_provider: str = "groq"
+    agent_chat_model: str = "llama-3.3-70b-versatile"
+    agent_self_correction_provider: str = "groq"
+    agent_self_correction_model: str = "llama-3.3-70b-versatile"
+    agent_extraction_provider: str = "groq"
+    agent_extraction_model: str = "llama-3.3-70b-versatile"
+
+    # When True, the model factory reads the active DB-backed ModelConfig row for each
+    # role (set via the Admin API), falling back to the env values above when no row
+    # exists. When False, the factory ignores the DB entirely and uses env only — a
+    # kill-switch back to pure Phase-1 behavior. See MODEL_VENDOR_PICKING_PLAN.md §3.3.
+    model_config_db_enabled: bool = True
+
+    # Surface Anthropic extended thinking (Claude 3.7+/4 reasoning) as thinking deltas.
+    # Off by default because enabling it forces temperature=1 and reserves part of the
+    # output budget for thinking — a behavior change for the generation slot. Reasoning
+    # surfacing for Groq / Ollama / DeepSeek / Qwen is always-on and needs no flag.
+    agent_anthropic_extended_thinking: bool = False
+    # Token budget reserved for Anthropic extended thinking when enabled (< max_tokens).
+    agent_anthropic_thinking_budget: int = 2048
+
     # Optional backends for non-default slots.
     anthropic_api_key: str = ""
     ollama_base_url: str = "http://localhost:11434"
+    # OpenAI (and Azure / OpenAI-compatible gateways via openai_base_url).
+    openai_api_key: str = ""
+    openai_base_url: str = ""
+    # Generic OpenAI-protocol endpoint for the 'openai_compatible' provider — also the
+    # home for vLLM, LM Studio, Together, OpenRouter, local gateways. Required when a
+    # slot selects provider 'openai_compatible' or 'vllm'.
+    openai_compatible_base_url: str = ""
+    # First-class OpenAI-compatible vendors — preset base_urls, own key slots. The
+    # base_urls can be overridden per role/config if a vendor changes endpoints.
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com"
+    qwen_api_key: str = ""
+    # Alibaba DashScope OpenAI-compatible mode — international endpoint.
+    qwen_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 
     # How long (seconds) the agent layer caches a connector's discovered tool list
     # before re-discovering. Tool lists rarely change between queries; caching avoids
@@ -110,6 +170,32 @@ class Settings(BaseSettings):
     # (server down / timeout). A failing connector must not make every query pay its
     # timeout again; 0 disables the negative cache (the circuit breaker still applies).
     agent_discovery_failure_ttl_seconds: int = 60
+
+    # Native tool-calling for tool/argument selection (live reads + gated actions).
+    # When True, the selector binds each candidate tool's real input_schema to the model
+    # and reads provider-validated tool_calls, instead of coercing JSON out of prose — so
+    # arguments (e.g. a Gmail body) conform to the tool's schema. Falls back automatically
+    # to the JSON path on any provider/parse failure. Set False to force the JSON path.
+    agent_native_tool_calling: bool = True
+    # Cap (chars) on the gathered-evidence block fed into action selection so the model
+    # grounds an action's arguments (the email body, the page content) in what was actually
+    # retrieved, without blowing the prompt. 0 omits the evidence block.
+    agent_action_context_max_chars: int = 6000
+    # Content-aware findings: when a read returns evidence, the controller's finding carries
+    # a short preview of WHAT was found (not just a count), so it can judge sufficiency
+    # instead of re-reading blind. These bound that preview.
+    agent_finding_preview_items: int = 4      # at most this many evidence snippets per read
+    agent_finding_preview_chars: int = 240    # at most this many chars per snippet
+
+    # ── Classic chat context enrichment ──────────────────────
+    # Whole-document expansion: when the retrieved chunks concentrate on one corpus
+    # document, pull its full text into the chat answer for richer context. Token-guarded
+    # so a long document can't blow the context window (chars/4 ≈ tokens).
+    chat_whole_doc_enabled: bool = True
+    chat_whole_doc_min_chunks: int = 2        # ≥ this many chunks from one doc → expand it
+    chat_whole_doc_max_chars: int = 12000     # hard cap on the pulled full-text (≈3k tokens)
+    # Per-attachment text cap fed into the chat context (a big upload can't dominate).
+    chat_attachment_max_chars: int = 8000
 
     # ── ChromaDB ─────────────────────────────────────────────
     chroma_persist_directory: str = "./chroma_data"

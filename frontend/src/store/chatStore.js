@@ -30,11 +30,18 @@ export const useChatStore = create((set, get) => ({
     set({ activeConversationId: conversationId });
     try {
       const data = await queryService.getConversation(conversationId);
-      // Map backend 'citations' to frontend 'sources' so they persist on reload
-      const messages = (data.messages || []).map((m) => ({
-        ...m,
-        sources: m.sources || m.citations || [],
-      }));
+      // Map backend 'citations' to frontend 'sources' so they persist on reload. A user
+      // turn's citations are attachment refs → rehydrate them as chips on the bubble.
+      const messages = (data.messages || []).map((m) => {
+        const cits = m.sources || m.citations || [];
+        if (m.role === 'user') {
+          const attachments = cits
+            .filter((c) => c.source_type === 'attachment')
+            .map((c) => ({ id: c.attachment_id, filename: c.filename, kind: c.kind }));
+          return { ...m, attachments };
+        }
+        return { ...m, sources: cits };
+      });
       set({ messages });
     } catch {
       set({ messages: [] });
@@ -46,7 +53,8 @@ export const useChatStore = create((set, get) => ({
   },
 
   // ── Streaming chat ──
-  sendMessage: (query) => {
+  // `attachments` = [{ id, filename, kind }] already uploaded to the shared store.
+  sendMessage: (query, attachments = []) => {
     const { activeConversationId, messages, streamController } = get();
 
     // Cancel any existing stream
@@ -54,11 +62,12 @@ export const useChatStore = create((set, get) => ({
       streamController.abort();
     }
 
-    // Add user message optimistically
+    // Add user message optimistically (attachments shown as chips on the bubble)
     const userMessage = {
       id: `temp-user-${Date.now()}`,
       role: 'user',
       content: query,
+      attachments,
       created_at: new Date().toISOString(),
     };
 
@@ -163,10 +172,27 @@ export const useChatStore = create((set, get) => ({
           set({ messages: updated });
         }
         set({ isStreaming: false, streamController: null });
-      }
+      },
+      // attachment ids → folded into the answer context as [Attachment N]
+      attachments.map((a) => a.id).filter(Boolean)
     );
 
     set({ streamController: controller });
+  },
+
+  // Re-run the last turn (used by the "Try again" affordance on a failed answer): drop the
+  // failed assistant reply and its prompting user message, then resend with the same text
+  // and attachments.
+  retryLast: () => {
+    const { messages, isStreaming } = get();
+    if (isStreaming || messages.length === 0) return;
+    const next = [...messages];
+    if (next[next.length - 1]?.role === 'assistant') next.pop();
+    const lastUser = next[next.length - 1];
+    if (!lastUser || lastUser.role !== 'user') return;
+    next.pop();
+    set({ messages: next });
+    get().sendMessage(lastUser.content, lastUser.attachments || []);
   },
 
   deleteConversation: async (conversationId) => {

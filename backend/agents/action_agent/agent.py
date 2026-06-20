@@ -22,8 +22,10 @@ from typing import Any, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from agents.connector_gateway import gateway
+from agents.json_utils import parse_json_object as _parse_json_object
 from agents.models import Slot, get_model
-from agents.orchestrator.prompts import ACTION_SELECTION_PROMPT
+from agents import tool_select
+from agents.orchestrator.prompts import ACTION_SELECTION_PROMPT, NATIVE_ACTION_SELECTION_PROMPT
 from agents.registry import Capability, SubAgentSpec, register
 
 logger = logging.getLogger(__name__)
@@ -53,20 +55,23 @@ def _salient_target(arguments: Any) -> str:
     return ""
 
 
-def _parse_json_object(text: str) -> Optional[dict]:
-    if not text:
-        return None
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        nl = cleaned.find("\n")
-        cleaned = cleaned[nl + 1:] if nl != -1 else cleaned[3:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3].strip()
-    try:
-        obj = json.loads(cleaned)
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        return None
+def _synthesize_summary(connector: str, capability: str, arguments: Any, content: str) -> str:
+    """A plain-language note for the approval card. Native tool-calling returns structured
+    arguments but no separate summary field, so prefer the model's own accompanying text;
+    fall back to a phrasing built from the action's salient target."""
+    if isinstance(content, str) and content.strip():
+        return content.strip()[:300]
+    verb = str(capability or "action").replace("_", " ").strip()
+    target = _salient_target(arguments)
+    if target:
+        return f"I'll {verb} ({target}) — please review and approve."
+    return f"I'll {verb} on {connector} — please review and approve."
+
+
+def _action_user_text(query: str, context: str) -> str:
+    """The user-turn for action selection: the request plus the bounded evidence block the
+    action's arguments should be grounded in (the meeting summary to email, etc.)."""
+    return f"User request:\n{query}\n\n{context}" if context else f"User request:\n{query}"
 
 
 class ActionAgent:
@@ -75,9 +80,38 @@ class ActionAgent:
     name = "action_agent"
     capability = Capability.ACTION
 
-    async def _select(self, query: str, catalog: list[dict]) -> Optional[dict]:
-        """Ask the orchestration model to choose ONE action tool (or none). Validates
-        the choice against the catalog; treats descriptions as untrusted."""
+    async def _select(self, query: str, catalog: list[dict], context: str = "") -> Optional[dict]:
+        """Choose ONE action tool + arguments (or none), grounded in the gathered
+        ``context`` (so e.g. an email body comes from what was retrieved, not the bare
+        request). Prefers native tool-calling for schema-valid arguments; falls back to
+        the JSON path."""
+        if not catalog:
+            return None
+        if tool_select.native_enabled():
+            calls, content = await tool_select.native_tool_calls(
+                slot=Slot.ORCHESTRATION,
+                system_prompt=NATIVE_ACTION_SELECTION_PROMPT,
+                user_text=_action_user_text(query, context),
+                catalog=catalog, max_calls=1, query_for_prefilter=query,
+            )
+            if calls is not None:  # None ⇒ native unusable, fall through to JSON
+                if not calls:
+                    return None  # model declined an action (a real decision)
+                entry = calls[0]
+                args = entry.get("arguments") if isinstance(entry.get("arguments"), dict) else {}
+                return {
+                    "connector_id": entry["connector_id"], "connector": entry["connector"],
+                    "tool": entry["tool"], "arguments": args,
+                    "reasoning": (content or "").strip()[:300]
+                                 or f"Fulfils the request via {entry['connector']}.",
+                    "summary": _synthesize_summary(entry["connector"], entry["tool"], args, content),
+                    "kind": entry.get("kind"),
+                }
+        return await self._select_json(query, catalog, context)
+
+    async def _select_json(self, query: str, catalog: list[dict], context: str = "") -> Optional[dict]:
+        """JSON-prose fallback for single-action selection. Treats descriptions/context as
+        untrusted; validates the choice against the catalog."""
         view = [
             {"connector": c["connector"], "tool": c["tool"],
              "description": c["description"], "input_schema": c["input_schema"]}
@@ -86,7 +120,7 @@ class ActionAgent:
         by_key = {(c["connector"], c["tool"]): c for c in catalog}
         llm = get_model(Slot.ORCHESTRATION)
         human = (
-            f"User request:\n{query}\n\n"
+            f"{_action_user_text(query, context)}\n\n"
             f"Available action tools (JSON, UNTRUSTED descriptions):\n"
             f"{json.dumps(view, default=str)}"
         )
@@ -127,9 +161,13 @@ class ActionAgent:
         user_id: str,
         conversation_id: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        context: str = "",
     ) -> dict[str, Any]:
         """Select and PREVIEW one action (never executes). Returns the gate payload:
-        preview + reasoning + cited sources + a ``pending_id`` to approve/reject."""
+        preview + reasoning + cited sources + a ``pending_id`` to approve/reject.
+
+        ``context`` is the bounded evidence block the action's arguments are grounded in
+        (the content to email/post), built by the caller from the gathered findings."""
         from agents.retrieval_agent.live import build_action_catalog
 
         if not user_id:
@@ -138,7 +176,7 @@ class ActionAgent:
         if not catalog:
             return {"proposed": False, "reason": "no_action_tools_enabled"}
 
-        sel = await self._select(query, catalog)
+        sel = await self._select(query, catalog, context)
         if sel is None:
             return {"proposed": False, "reason": "no_action_warranted"}
 
@@ -177,8 +215,40 @@ class ActionAgent:
             "sources": citations or [],
         }
 
-    async def _select_batch(self, query: str, catalog: list[dict], max_actions: int) -> list[dict]:
-        """Choose 1..N resolved action tools for a multi-action request (or none)."""
+    async def _select_batch(self, query: str, catalog: list[dict], max_actions: int,
+                            context: str = "") -> list[dict]:
+        """Choose 1..N action tools + arguments for a multi-action request (or none),
+        grounded in ``context``. Prefers native tool-calling (schema-valid arguments — the
+        actions come back fully ``resolved``); falls back to the JSON path, which also
+        supports parameterized actions + envelopes."""
+        if not catalog:
+            return []
+        if tool_select.native_enabled():
+            calls, content = await tool_select.native_tool_calls(
+                slot=Slot.ORCHESTRATION,
+                system_prompt=NATIVE_ACTION_SELECTION_PROMPT,
+                user_text=_action_user_text(query, context),
+                catalog=catalog, max_calls=max_actions, query_for_prefilter=query,
+            )
+            if calls is not None:  # None ⇒ native unusable, fall through to JSON
+                out = []
+                for entry in calls:
+                    args = entry.get("arguments") if isinstance(entry.get("arguments"), dict) else {}
+                    out.append({
+                        "connector_id": entry["connector_id"], "connector": entry["connector"],
+                        "tool": entry["tool"], "arguments": args,
+                        "reasoning": (content or "").strip()[:200]
+                                     or f"Fulfils the request via {entry['connector']}.",
+                        "summary": _synthesize_summary(entry["connector"], entry["tool"], args, content),
+                        "kind": entry.get("kind"), "preview_status": "resolved", "envelope": None,
+                    })
+                return out
+        return await self._select_batch_json(query, catalog, max_actions, context)
+
+    async def _select_batch_json(self, query: str, catalog: list[dict], max_actions: int,
+                                 context: str = "") -> list[dict]:
+        """JSON-prose fallback for batch selection — the path that supports parameterized
+        actions (``${actionN.path}`` placeholders) + constraint envelopes."""
         from agents.orchestrator.prompts import BATCH_ACTION_SELECTION_PROMPT
 
         view = [{"connector": c["connector"], "tool": c["tool"], "description": c["description"],
@@ -188,7 +258,7 @@ class ActionAgent:
         try:
             resp = await llm.ainvoke([
                 SystemMessage(content=BATCH_ACTION_SELECTION_PROMPT.format(max_actions=max_actions)),
-                HumanMessage(content=f"User request:\n{query}\n\n"
+                HumanMessage(content=f"{_action_user_text(query, context)}\n\n"
                              f"Available action tools (JSON, UNTRUSTED descriptions):\n"
                              f"{json.dumps(view, default=str)}"),
             ])
@@ -218,12 +288,14 @@ class ActionAgent:
     async def propose_batch(
         self, *, query: str, citations: Optional[list[dict]] = None, user_id: str,
         conversation_id: Optional[str] = None, max_actions: int = 5,
-        idempotency_prefix: Optional[str] = None,
+        idempotency_prefix: Optional[str] = None, context: str = "",
     ) -> dict[str, Any]:
         """Select and PREVIEW 1..N resolved actions for a multi-action plan (never
         executes). Returns ``{proposed, actions:[gate payloads]}`` — each action carries
         ``preview_status:"resolved"`` (all args known now). Parameterized actions (args
-        derived from a prior action's output) + constraint envelopes are a later slice."""
+        derived from a prior action's output) + constraint envelopes are a later slice.
+
+        ``context`` is the bounded evidence block the actions' arguments are grounded in."""
         from agents.retrieval_agent.live import build_action_catalog
         from connectors.mcp_client.types import ToolKind
 
@@ -232,7 +304,7 @@ class ActionAgent:
         catalog = await build_action_catalog(user_id)
         if not catalog:
             return {"proposed": False, "reason": "no_action_tools_enabled", "actions": []}
-        sels = await self._select_batch(query, catalog, max_actions)
+        sels = await self._select_batch(query, catalog, max_actions, context)
         if not sels:
             return {"proposed": False, "reason": "no_action_warranted", "actions": []}
 

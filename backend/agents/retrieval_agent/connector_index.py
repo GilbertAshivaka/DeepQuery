@@ -148,15 +148,16 @@ def _ensure_embedded(connectors: list[dict[str, Any]]) -> bool:
         return True
 
     try:
-        from embeddings.gemini_embedder import gemini_embedder
-    except Exception as exc:  # embedder not importable (e.g. SDK/key missing)
-        logger.warning("Connector semantic index unavailable (embedder import failed): %s", exc)
+        from embeddings import get_embedder
+        embedder = get_embedder()
+    except Exception as exc:  # embedder not importable/buildable (e.g. SDK/key missing)
+        logger.warning("Connector semantic index unavailable (embedder unavailable): %s", exc)
         return False
 
     for start in range(0, len(pending), _EMBED_BATCH):
         chunk = pending[start:start + _EMBED_BATCH]
         try:
-            vectors = gemini_embedder.embed_texts_batch(
+            vectors = embedder.embed_texts_batch(
                 [t for _, t in chunk], task_type="RETRIEVAL_DOCUMENT"
             )
         except Exception as exc:
@@ -190,8 +191,8 @@ def resolve(
         return None
 
     try:
-        from embeddings.gemini_embedder import gemini_embedder
-        qvec = gemini_embedder.embed_text(" ; ".join(phrases), task_type="RETRIEVAL_QUERY")
+        from embeddings import get_embedder
+        qvec = get_embedder().embed_text(" ; ".join(phrases), task_type="RETRIEVAL_QUERY")
     except Exception as exc:
         logger.warning("Connector intent embedding failed: %s", exc)
         return None

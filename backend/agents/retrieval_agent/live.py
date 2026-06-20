@@ -29,12 +29,15 @@ from typing import Any, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from agents.connector_gateway import gateway as _gateway
+from agents.json_utils import parse_json_object as _parse_json_object
 from agents.models import Slot, get_model
+from agents import tool_select
 from agents.retrieval_agent import connector_index
 from agents.orchestrator.prompts import (
     LIVE_CONNECTOR_INTENT_PROMPT,
     LIVE_CONNECTOR_SELECTION_PROMPT,
     LIVE_TOOL_SELECTION_PROMPT,
+    NATIVE_READ_SELECTION_PROMPT,
 )
 from connectors.governance import available_for_role, is_enabled
 from connectors.mcp_client.types import ToolKind
@@ -181,9 +184,36 @@ async def _discover_tools(conn: dict[str, Any], user_id: Optional[str] = None,
         "mutates": t.mutates,
     } for t in disc.tools]
 
+    # Self-heal an empty connector summary from what we just discovered, so the agent's
+    # connector pre-selection AND the controller's planning have a real description to
+    # reason about (not just a bare name) on subsequent runs. Network-free thereafter; never
+    # overwrites an admin-written summary. Best-effort — a write failure must not break reads.
+    if not (conn.get("summary") or "").strip() and disc.tools:
+        await asyncio.to_thread(_persist_derived_summary, cid, disc)
+
     if ttl > 0:
         _DISCOVERY_CACHE[cid] = (time.time() + ttl, tools)
     return tools
+
+
+def _persist_derived_summary(connector_id: str, disc) -> None:
+    """Derive a one-line summary from a discovery (server title + tool names) and persist it
+    if the connector has none. Runs in a thread (sync DB). Swallows all errors."""
+    try:
+        names = [t.name for t in disc.tools[:8] if getattr(t, "name", None)]
+        if not names:
+            return
+        title = (getattr(disc, "server_title", None) or "").strip()
+        summary = (f"{title}. " if title else "") + "Tools: " + ", ".join(names)
+        from connectors.gateway.registry import set_connector_summary_if_empty
+        db = SessionLocal()
+        try:
+            if set_connector_summary_if_empty(db, connector_id=connector_id, summary=summary):
+                connector_index.clear_connector_index()  # re-embed with the new text next use
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.debug("summary self-heal skipped for %s: %s", connector_id, exc)
 
 
 def _is_auto_read(t: dict[str, Any]) -> bool:
@@ -233,22 +263,6 @@ async def _build_catalog(user_id: str) -> list[dict[str, Any]]:
 async def build_action_catalog(user_id: str) -> list[dict[str, Any]]:
     """Gated-action catalog for the Action Sub-Agent (SDK ACTION tools)."""
     return [t for t in await _all_tools(user_id) if _is_gated_action(t)]
-
-
-def _parse_json_object(text: str) -> Optional[dict]:
-    if not text:
-        return None
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        nl = cleaned.find("\n")
-        cleaned = cleaned[nl + 1:] if nl != -1 else cleaned[3:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3].strip()
-    try:
-        obj = json.loads(cleaned)
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        return None
 
 
 def _prefilter_connectors(query: str, connectors: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -371,9 +385,38 @@ async def _select_by_resolve(query: str, connectors: list[dict[str, Any]]) -> li
     return list(chosen.values())[:max_n]
 
 
+def _normalize_call(entry: dict[str, Any]) -> dict[str, Any]:
+    """A catalog entry (+ its built ``arguments``) → the minimal call the gateway needs."""
+    args = entry.get("arguments")
+    return {
+        "connector_id": entry["connector_id"],
+        "connector": entry["connector"],
+        "tool": entry["tool"],
+        "arguments": args if isinstance(args, dict) else {},
+    }
+
+
 async def _select_calls(query: str, catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Ask the orchestration model which catalog tools to call. Validates the
-    model's choices against the catalog and bounds the count."""
+    """Choose which catalog read-tools to call (+ arguments). Prefers native tool-calling
+    so the arguments are validated against each tool's input schema; falls back to the
+    JSON path on any provider/binding failure. Both bound to ``MAX_LIVE_CALLS``."""
+    if not catalog:
+        return []
+    if tool_select.native_enabled():
+        calls, _content = await tool_select.native_tool_calls(
+            slot=Slot.ORCHESTRATION,
+            system_prompt=NATIVE_READ_SELECTION_PROMPT.format(max_calls=MAX_LIVE_CALLS),
+            user_text=f"User request:\n{query}",
+            catalog=catalog, max_calls=MAX_LIVE_CALLS, query_for_prefilter=query,
+        )
+        if calls is not None:  # None ⇒ native unusable, fall through to JSON
+            return [_normalize_call(c) for c in calls]
+    return await _select_calls_json(query, catalog)
+
+
+async def _select_calls_json(query: str, catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """JSON-prose fallback: hand the model the catalog and parse a ``{"calls": [...]}``
+    object. Validates choices against the catalog and bounds the count."""
     # Present only the fields the model needs; descriptions are untrusted.
     catalog_view = [
         {"connector": c["connector"], "tool": c["tool"],

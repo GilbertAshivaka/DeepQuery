@@ -16,6 +16,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from core.config import settings
 from core.constants import (
     COSINE_SIMILARITY_THRESHOLD,
     DENSE_TOP_K,
@@ -26,6 +27,21 @@ from core.constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_whole_doc(document_id: str) -> tuple:
+    """Re-parse a corpus document's full text (sync; runs in an executor). Mirrors the
+    Agent layer's whole-doc helper so chat and agent expand documents identically."""
+    from core.database import SessionLocal
+    from agents.documents import extract_document_text
+    db = SessionLocal()
+    try:
+        return extract_document_text(db, document_id)
+    except Exception as exc:
+        logger.warning("Whole-doc extraction failed for %s: %s", document_id, exc)
+        return ("", "")
+    finally:
+        db.close()
 
 
 def apply_cosine_similarity_filter(
@@ -78,6 +94,7 @@ async def gather_context(
     allowed_collections: List[str],
     image_base64: Optional[str] = None,
     chat_history: Optional[list] = None,
+    want_whole_doc: bool = False,
 ) -> Dict[str, Any]:
     """Run the retrieval-only path (no answer generation).
 
@@ -94,7 +111,7 @@ async def gather_context(
         'chunks_retrieved', 'query', 'retrieval_time_ms' — or {'error': str} if the
         query could not be embedded.
     """
-    from embeddings.gemini_embedder import gemini_embedder
+    from embeddings import get_embedder
     from knowledge_graph.neo4j_client import neo4j_client
     from llm.groq_client import groq_client
     from retrieval.bm25_retriever import bm25_retriever
@@ -102,22 +119,23 @@ async def gather_context(
     from vectorstore.chroma_store import chroma_store
 
     start = time.time()
+    embedder = get_embedder()
 
     # ── GROUP A: Parallel execution (embedding, BM25, entity extraction) ──
     logger.info("Group A: Embedding, BM25 search, entity extraction (parallel)")
 
     async def embed_query_task():
-        """Task: Embed the query using Gemini."""
+        """Task: Embed the query using the active embedder."""
         loop = asyncio.get_event_loop()
         if image_base64:
             import base64
             image_bytes = base64.b64decode(image_base64)
             return await loop.run_in_executor(
-                None, gemini_embedder.embed_multimodal, query, image_bytes
+                None, embedder.embed_multimodal, query, image_bytes
             )
         else:
             return await loop.run_in_executor(
-                None, gemini_embedder.embed_text, query, "RETRIEVAL_QUERY"
+                None, embedder.embed_text, query, "RETRIEVAL_QUERY"
             )
 
     async def bm25_search_task():
@@ -228,6 +246,7 @@ async def gather_context(
     citations = []
     for i, chunk in enumerate(formatted_chunks, 1):
         citations.append({
+            "source_type": "document",
             "source_number": i,
             "document_name": chunk["source"],
             "page_number": chunk["page"],
@@ -236,11 +255,34 @@ async def gather_context(
             "relevance_score": chunk.get("relevance_score", 0.5),
         })
 
+    # ── Whole-document expansion (token-guarded) ─────────────
+    # When the retrieved chunks concentrate on a single corpus document, pull its full text
+    # so the model has complete context, not just fragments. Capped so a long document can't
+    # blow the context window. Mirrors the Agent layer's whole-doc behavior.
+    whole_documents: List[Dict[str, Any]] = []
+    if want_whole_doc and settings.chat_whole_doc_enabled and formatted_chunks:
+        from collections import Counter
+        ids = [c["document_id"] for c in formatted_chunks if c.get("document_id")]
+        if ids:
+            top_id, count = Counter(ids).most_common(1)[0]
+            if top_id and count >= max(2, settings.chat_whole_doc_min_chunks):
+                title, text = await loop.run_in_executor(None, _extract_whole_doc, top_id)
+                if text:
+                    cap = settings.chat_whole_doc_max_chars
+                    if cap and len(text) > cap:
+                        text = text[:cap] + " …[truncated]"
+                    whole_documents.append({"document_id": top_id, "title": title, "text": text})
+                    citations.append({
+                        "source_type": "document_full", "doc_number": 1,
+                        "document_name": title, "document_id": top_id,
+                    })
+
     elapsed = time.time() - start
     logger.info(f"Context gathering completed in {elapsed:.2f}s")
 
     return {
         "formatted_chunks": formatted_chunks,
+        "whole_documents": whole_documents,
         "citations": citations,
         "graph_context": graph_context,
         "chunks_retrieved": len(context_chunks),
@@ -254,20 +296,24 @@ async def retrieval_pipeline(
     allowed_collections: List[str],
     image_base64: Optional[str] = None,
     chat_history: Optional[list] = None,
+    attachments: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Execute the full retrieval + generation pipeline (the chat path).
 
-    Gathers context via ``gather_context`` then generates the answer with the
-    Groq/Llama client — unchanged behavior for the existing chat endpoint.
+    Gathers context via ``gather_context`` (now with token-guarded whole-document
+    expansion) then generates the answer with the Groq/Llama client. ``attachments`` are
+    user-attached files ([{filename, text, ...}]) folded into the context as [Attachment N].
 
     Returns:
-        dict with 'answer', 'citations', 'formatted_chunks', 'query',
+        dict with 'answer', 'citations', 'formatted_chunks', 'whole_documents', 'query',
         'self_correction_status', 'related_documents', 'chunks_retrieved',
         'retrieval_time_ms'.
     """
     from llm.groq_client import groq_client
 
-    ctx = await gather_context(query, allowed_collections, image_base64, chat_history)
+    ctx = await gather_context(
+        query, allowed_collections, image_base64, chat_history, want_whole_doc=True
+    )
 
     if ctx.get("error"):
         return {
@@ -279,6 +325,18 @@ async def retrieval_pipeline(
         }
 
     formatted_chunks = ctx["formatted_chunks"]
+    whole_documents = ctx.get("whole_documents", [])
+    attachments = attachments or []
+
+    # Attachment citations ride alongside the document/whole-doc citations so they show in
+    # the grouped chips under the answer.
+    citations = list(ctx["citations"])
+    for i, att in enumerate(attachments, 1):
+        citations.append({
+            "source_type": "attachment", "attachment_number": i,
+            "filename": att.get("filename", f"attachment-{i}"),
+            "attachment_id": att.get("attachment_id"),
+        })
 
     # RAG generation (Groq/Llama) — runs in executor to stay non-blocking.
     loop = asyncio.get_event_loop()
@@ -289,6 +347,8 @@ async def retrieval_pipeline(
         formatted_chunks,
         ctx["graph_context"],
         chat_history,
+        whole_documents,
+        attachments,
     )
 
     if answer is None:
@@ -296,8 +356,9 @@ async def retrieval_pipeline(
 
     return {
         "answer": answer,
-        "citations": ctx["citations"],
+        "citations": citations,
         "formatted_chunks": formatted_chunks,  # For self-correction
+        "whole_documents": whole_documents,
         "query": query,  # For self-correction
         "self_correction_status": "PENDING",  # Will be verified in background
         "related_documents": [],
@@ -320,12 +381,13 @@ async def search_pipeline(
 
     Returns structured results with relevance scores.
     """
-    from embeddings.gemini_embedder import gemini_embedder
+    from embeddings import get_embedder
     from retrieval.bm25_retriever import bm25_retriever
     from retrieval.reranker import reranker
     from vectorstore.chroma_store import chroma_store
 
     loop = asyncio.get_event_loop()
+    embedder = get_embedder()
 
     # Build metadata filter
     where_filter = {}
@@ -335,7 +397,7 @@ async def search_pipeline(
     # Parallel execution: Embed query and BM25 search
     async def embed_task():
         return await loop.run_in_executor(
-            None, gemini_embedder.embed_text, query, "RETRIEVAL_QUERY"
+            None, embedder.embed_text, query, "RETRIEVAL_QUERY"
         )
 
     async def bm25_task():

@@ -14,8 +14,21 @@ import chromadb
 
 from core.config import settings
 from core.constants import Collection
+from embeddings.identity import (
+    active_embedding_identity,
+    describe,
+    extract_identity,
+    identity_matches,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class ChromaIdentityError(RuntimeError):
+    """Raised when a collection's recorded embedding identity does not match the
+    active one — i.e. the configured embedder cannot safely query this collection's
+    vector space. Switching embedders requires a re-index (see
+    MODEL_VENDOR_PICKING_PLAN.md §7), not a config flip."""
 
 
 class ChromaStore:
@@ -24,6 +37,8 @@ class ChromaStore:
     def __init__(self):
         self._client = None
         self._collections: Dict[str, Any] = {}
+        self._active_version: str = ""        # active physical collection suffix
+        self._version_stamp: Any = None       # config version the above was read at
 
     @property
     def client(self):
@@ -42,14 +57,96 @@ class ChromaStore:
                 )
         return self._client
 
-    def get_collection(self, name: str):
-        """Get or create a ChromaDB collection."""
-        if name not in self._collections:
-            self._collections[name] = self.client.get_or_create_collection(
-                name=name,
-                metadata={"hnsw:space": "cosine"},
+    def _active_collection_version(self) -> str:
+        """The active physical-collection suffix. Read from the active embedding config
+        (``collection_version`` param), set atomically by a completed re-index; falls
+        back to the env default. Cached against the config version — when that bumps and
+        the suffix changes, cached collection handles are dropped so the next access
+        resolves to the new physical collections."""
+        try:
+            from agents.models import config_store
+
+            stamp = config_store.current_version()
+            if self._version_stamp != stamp:
+                ver = ""
+                row = config_store.resolve_role("embedding")
+                if row:
+                    ver = str((row.get("params") or {}).get("collection_version") or "")
+                ver = (ver or settings.embedding_collection_version or "").strip()
+                if ver != self._active_version:
+                    self._collections.clear()
+                self._active_version = ver
+                self._version_stamp = stamp
+            return self._active_version
+        except Exception:
+            return (settings.embedding_collection_version or "").strip()
+
+    def _physical_name(self, logical_name: str) -> str:
+        """Resolve a logical collection name (the RBAC names — academic, …) to its
+        physical name. Empty version = bare logical name (current/legacy layout); a
+        re-index migration sets a version suffix (e.g. ``academic__v2``) and flips the
+        active pointer once verified."""
+        version = self._active_collection_version()
+        return f"{logical_name}__{version}" if version else logical_name
+
+    def get_physical_collection(self, physical_name: str, identity: Optional[Dict] = None):
+        """Direct handle to a collection by exact physical name — no logical→physical
+        resolution and no identity assertion. Used by the re-index job to write shadow
+        collections before they become active. Records the given embedding identity."""
+        meta = {"hnsw:space": "cosine"}
+        if identity:
+            meta.update(identity)
+        return self.client.get_or_create_collection(name=physical_name, metadata=meta)
+
+    def _verify_identity(self, collection, active: dict) -> None:
+        """Assert the collection's recorded embedding identity matches the active one.
+
+        - No recorded identity → legacy collection (predates the guard); backfill the
+          active identity (all legacy collections were built with the historical
+          embedder) so future switches are caught.
+        - Recorded but mismatched → hard error (wrong vector space).
+        """
+        if not settings.embedding_identity_guard:
+            return
+        recorded = extract_identity(getattr(collection, "metadata", None))
+        if recorded is None:
+            try:
+                merged = dict(getattr(collection, "metadata", None) or {})
+                merged.update(active)
+                collection.modify(metadata=merged)
+                logger.info(
+                    "Backfilled embedding identity %s onto collection '%s'",
+                    describe(active),
+                    collection.name,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Could not backfill embedding identity on '%s': %s",
+                    collection.name,
+                    e,
+                )
+            return
+        if not identity_matches(recorded, active):
+            raise ChromaIdentityError(
+                f"Embedding identity mismatch on collection '{collection.name}': "
+                f"recorded {describe(recorded)} != active {describe(active)}. "
+                f"Switching embedders requires a re-index "
+                f"(see MODEL_VENDOR_PICKING_PLAN.md §7)."
             )
-        return self._collections[name]
+
+    def get_collection(self, name: str):
+        """Get or create a ChromaDB collection (by logical RBAC name), verifying its
+        embedding identity matches the active embedder."""
+        physical = self._physical_name(name)
+        if physical not in self._collections:
+            active = active_embedding_identity()
+            collection = self.client.get_or_create_collection(
+                name=physical,
+                metadata={"hnsw:space": "cosine", **active},
+            )
+            self._verify_identity(collection, active)
+            self._collections[physical] = collection
+        return self._collections[physical]
 
     def ensure_collections(self) -> None:
         """Ensure all four RBAC collections exist."""

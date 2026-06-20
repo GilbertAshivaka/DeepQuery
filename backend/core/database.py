@@ -74,6 +74,9 @@ def init_db():
         AgentConversation,
         AgentTurn,
         AgentAttachment,
+        ModelConfig,
+        ProviderKey,
+        AppSetting,
     )
 
     Base.metadata.create_all(bind=engine)

@@ -4,17 +4,22 @@ Deep Query — Authentication Endpoints
 POST /auth/login
 POST /auth/refresh
 POST /auth/logout
+GET  /auth/me
+PATCH /auth/me
+POST /auth/me/password
 """
 
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from auth.jwt_handler import (
     create_access_token,
     create_refresh_token,
     decode_token,
+    hash_password,
     hash_token,
     verify_password,
 )
@@ -23,8 +28,11 @@ from core.database import get_db
 from models.database import RefreshToken, User
 from models.schemas import (
     LoginRequest,
+    PasswordChange,
+    ProfileUpdate,
     RefreshRequest,
     TokenResponse,
+    UserResponse,
 )
 
 router = APIRouter()
@@ -121,3 +129,58 @@ def logout(
         stored.is_revoked = True
         db.commit()
     return {"message": "Logged out successfully."}
+
+
+# ── Self-service account ─────────────────────────────────────────
+
+
+@router.get("/me", response_model=UserResponse)
+def get_me(current_user: User = Depends(get_current_user)):
+    """The authenticated user's own profile. Canonical source for the app's user state."""
+    return current_user
+
+
+@router.patch("/me", response_model=UserResponse)
+def update_me(
+    body: ProfileUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update the caller's own profile (full name / email only). Username and role are
+    admin-managed and cannot be changed here."""
+    if body.full_name is not None:
+        current_user.full_name = body.full_name.strip()
+    if body.email is not None:
+        current_user.email = body.email.strip()
+    try:
+        db.commit()
+        db.refresh(current_user)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="That email is already in use.",
+        )
+    return current_user
+
+
+@router.post("/me/password")
+def change_my_password(
+    body: PasswordChange,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Change the caller's password. Requires the current password. Existing refresh
+    tokens are revoked so other sessions must re-authenticate."""
+    if not verify_password(body.current_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect.",
+        )
+    current_user.hashed_password = hash_password(body.new_password)
+    db.query(RefreshToken).filter(
+        RefreshToken.user_id == current_user.id,
+        RefreshToken.is_revoked == False,  # noqa: E712
+    ).update({RefreshToken.is_revoked: True})
+    db.commit()
+    return {"message": "Password changed successfully."}

@@ -38,6 +38,14 @@ async def lifespan(app: FastAPI):
     _run_migrations()
     _seed_admin_user()
 
+    # Seed DB-backed model config from env for any role not yet configured, so the
+    # admin Settings page has editable rows and env becomes the bootstrap floor.
+    try:
+        from agents.models import config_store
+        config_store.bootstrap_from_env()
+    except Exception as exc:
+        logger.warning("Model-config bootstrap skipped: %s", exc)
+
     # 2. Initialize all service clients
     print("Initializing service clients...")
     _init_service_clients()
@@ -183,13 +191,13 @@ async def _warmup_connections():
     except Exception as e:
         warmup_errors.append(f"Neo4j: {e}")
 
-    # Gemini Embedding API
+    # Embedding API (active embedder)
     try:
-        from embeddings.gemini_embedder import gemini_embedder
-        gemini_embedder.embed_text("warmup", task_type="RETRIEVAL_QUERY")
-        logger.info("✓ Gemini Embedding API warmed up")
+        from embeddings import get_embedder
+        get_embedder().embed_text("warmup", task_type="RETRIEVAL_QUERY")
+        logger.info("✓ Embedding API warmed up")
     except Exception as e:
-        warmup_errors.append(f"Gemini: {e}")
+        warmup_errors.append(f"Embedding: {e}")
 
     # Groq API
     try:

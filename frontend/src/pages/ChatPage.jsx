@@ -4,22 +4,64 @@ import { useChatStore } from '../store/chatStore';
 import { motion, AnimatePresence } from 'framer-motion';
 import MessageBubble from '../components/chat/MessageBubble';
 import SourceDrawer from '../components/chat/SourceDrawer';
-import { Send, StopCircle, Sparkles, BookOpen, GraduationCap, FlaskConical, Scale } from 'lucide-react';
+import AttachmentViewer from '../components/agents/AttachmentViewer';
+import ImageLightbox from '../components/agents/ImageLightbox';
+import * as agentService from '../services/agentService';
+import { Send, StopCircle, Sparkles, BookOpen, GraduationCap, FlaskConical, Scale,
+  Plus, X, Loader2, FileText, Image as ImageIcon } from 'lucide-react';
 
 export default function ChatPage() {
   const { conversationId } = useParams();
   const {
     messages,
     isStreaming,
+    activeConversationId,
     sendMessage,
+    retryLast,
     cancelStream,
     setActiveConversation,
   } = useChatStore();
 
   const [input, setInput] = useState('');
   const [selectedSource, setSelectedSource] = useState(null);
+  const [viewing, setViewing] = useState(null);   // an attached doc/image open in a panel
+  const [pendingAttachments, setPendingAttachments] = useState([]);
+  const [uploading, setUploading] = useState(false);
+
+  // Only one right-side surface at a time (source drawer vs attachment viewer).
+  const openSource = (s) => { setViewing(null); setSelectedSource(s); };
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
+  const fileRef = useRef(null);
+
+  const handleFiles = async (e) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';  // allow re-selecting the same file
+    if (!files.length) return;
+    setUploading(true);
+    try {
+      for (const file of files) {
+        // No conversation id: AgentAttachment.conversation_id FKs the *agent* conversations
+        // table, not the classical chat one. Ownership is by user; the chat links the file
+        // via the message's citation refs.
+        const data = await agentService.uploadAttachment(file);
+        setPendingAttachments((prev) => [...prev, { id: data.id, filename: data.filename, kind: data.kind }]);
+      }
+    } catch (err) {
+      console.error('Attachment upload failed:', err);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  // Open an attached file in-app like the agent: documents in a right-side panel, images
+  // in a lightbox. (Citation-only refs use `attachment_id`; bubble chips use `id`.)
+  const openAttachment = (a) => {
+    const id = a?.attachment_id || a?.id;
+    if (!id) return;
+    setSelectedSource(null);  // only one right-side surface at a time
+    setViewing({ id, filename: a.filename, kind: a.kind || 'document' });
+  };
 
   useEffect(() => {
     if (conversationId) {
@@ -38,9 +80,10 @@ export default function ChatPage() {
   const handleSubmit = (e) => {
     e.preventDefault();
     const query = input.trim();
-    if (!query || isStreaming) return;
+    if (!query || isStreaming || uploading) return;
     setInput('');
-    sendMessage(query);
+    sendMessage(query, pendingAttachments);
+    setPendingAttachments([]);
   };
 
   const handleKeyDown = (e) => {
@@ -80,7 +123,9 @@ export default function ChatPage() {
                     key={msg.id || idx}
                     message={msg}
                     isStreaming={isStreaming && idx === messages.length - 1 && msg.role === 'assistant'}
-                    onSourceClick={setSelectedSource}
+                    onSourceClick={openSource}
+                    onAttachmentClick={openAttachment}
+                    onRetry={idx === messages.length - 1 && !isStreaming ? retryLast : undefined}
                   />
                 ))}
                 <div ref={bottomRef} />
@@ -95,10 +140,56 @@ export default function ChatPage() {
             onSubmit={handleSubmit}
             className="max-w-3xl mx-auto"
           >
+            {/* Pending attachment chips (uploaded, attach on next send) */}
+            {pendingAttachments.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 mb-2">
+                {pendingAttachments.map((a) => (
+                  <span
+                    key={a.id}
+                    className="inline-flex items-center gap-1.5 pl-2 pr-1 py-1 text-[11px] rounded-lg
+                               bg-cream-100 border border-cream-200 text-ink-700"
+                  >
+                    {a.kind === 'image' ? <ImageIcon size={11} /> : <FileText size={11} />}
+                    <span className="truncate max-w-[160px]">{a.filename}</span>
+                    <button
+                      type="button"
+                      onClick={() => setPendingAttachments((prev) => prev.filter((x) => x.id !== a.id))}
+                      className="p-0.5 rounded hover:bg-cream-300/60 text-ink-500"
+                      title="Remove"
+                    >
+                      <X size={11} />
+                    </button>
+                  </span>
+                ))}
+                {uploading && (
+                  <span className="inline-flex items-center gap-1.5 px-2 py-1 text-[11px] text-ink-500">
+                    <Loader2 size={11} className="animate-spin" /> Uploading…
+                  </span>
+                )}
+              </div>
+            )}
             <div className="relative flex items-end gap-3 bg-cream-50 border border-cream-200/60 rounded-2xl
               shadow-[0_8px_60px_rgba(180,155,120,0.2)]
               focus-within:border-violet-400 focus-within:ring-2 focus-within:ring-violet-500/20 focus-within:shadow-[0_8px_68px_rgba(139,92,246,0.17)]
               transition-all duration-200 p-1.5">
+              <input
+                ref={fileRef}
+                type="file"
+                multiple
+                onChange={handleFiles}
+                className="hidden"
+                accept=".pdf,.txt,.md,.docx,.doc,.csv,.png,.jpg,.jpeg,.gif,.webp"
+              />
+              <button
+                type="button"
+                onClick={() => fileRef.current?.click()}
+                disabled={isStreaming || uploading}
+                className="flex-shrink-0 p-2.5 rounded-xl text-ink-500 hover:text-ink-800 hover:bg-cream-100
+                  disabled:opacity-40 transition-all self-end"
+                title="Add attachments"
+              >
+                {uploading ? <Loader2 size={18} className="animate-spin" /> : <Plus size={18} />}
+              </button>
               <textarea
                 ref={inputRef}
                 value={input}
@@ -145,13 +236,27 @@ export default function ChatPage() {
         </div>
       </div>
 
-      {/* Source Drawer */}
+      {/* Source Drawer (document citations) */}
       <AnimatePresence>
         {selectedSource && (
           <SourceDrawer
             source={selectedSource}
             onClose={() => setSelectedSource(null)}
           />
+        )}
+      </AnimatePresence>
+
+      {/* Attached document — right-side panel (PDF inline / parsed text), like the agent */}
+      <AnimatePresence>
+        {viewing && viewing.kind !== 'image' && (
+          <AttachmentViewer attachment={viewing} onClose={() => setViewing(null)} />
+        )}
+      </AnimatePresence>
+
+      {/* Attached image — lightbox */}
+      <AnimatePresence>
+        {viewing && viewing.kind === 'image' && (
+          <ImageLightbox attachment={viewing} onClose={() => setViewing(null)} />
         )}
       </AnimatePresence>
     </div>

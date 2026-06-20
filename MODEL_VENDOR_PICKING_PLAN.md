@@ -121,7 +121,7 @@ Single logical active config (keep history rows for audit/rollback; flag one `is
 | column | type | notes |
 |--------|------|-------|
 | `id` | uuid PK | |
-| `role` | str | `orchestration` \| `generation` \| `verification` \| `chat` \| `embedding` |
+| `role` | str | agent: `orchestration` \| `generation` \| `verification`; classic pipeline: `chat` \| `self_correction` \| `extraction`; plus `embedding` |
 | `provider` | str | `google` \| `groq` \| `anthropic` \| `openai` \| `openai_compatible` \| `ollama` \| `vllm` |
 | `model` | str | provider-native id (e.g. `claude-…`, `openai/gpt-oss-120b`) |
 | `base_url` | str null | for `openai_compatible` / self-hosted |

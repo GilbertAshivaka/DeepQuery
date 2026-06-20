@@ -189,9 +189,9 @@ class IngestionPipeline:
     ) -> List[Optional[List[float]]]:
         """Generate embeddings for all chunks using Gemini Embedding 2."""
         try:
-            from embeddings.gemini_embedder import gemini_embedder
+            from embeddings import get_embedder
 
-            return gemini_embedder.embed_chunks(chunks)
+            return get_embedder().embed_chunks(chunks)
         except Exception as e:
             logger.error(f"Embedding generation failed: {e}")
             return [None] * len(chunks)

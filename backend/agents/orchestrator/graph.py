@@ -31,6 +31,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from agents.models import Slot, get_model
+from agents.models.reasoning import extract_reasoning_delta, extract_text_delta
 from agents.orchestrator.prompts import (
     AGENT_GENERATION_PROMPT,
     AGENT_VERIFICATION_PROMPT,
@@ -181,6 +182,7 @@ class AgentState(TypedDict, total=False):
     loaded_skills: list[dict]    # {name,version,body,metadata} — pinned instruction channel
     has_documents: bool          # corpus available this run (hint to the controller)
     has_live: bool               # live tools available this run (hint to the controller)
+    connector_catalog: list[dict]  # enabled connectors [{connector, summary}] — controller visibility
     has_action: bool             # action tools available + durable (act decision enabled)
     has_produce: bool            # document sandbox available this run (produce enabled)
     # Document generation (DOCUMENT_GENERATION_SANDBOX_GUIDE)
@@ -194,21 +196,7 @@ class AgentState(TypedDict, total=False):
 
 # ── Helpers ──────────────────────────────────────────────────
 
-def _parse_json_object(text: str) -> Optional[dict]:
-    """Parse a JSON object from a model response, tolerating ```json fences."""
-    if not text:
-        return None
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        nl = cleaned.find("\n")
-        cleaned = cleaned[nl + 1:] if nl != -1 else cleaned[3:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3].strip()
-    try:
-        obj = json.loads(cleaned)
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        return None
+from agents.json_utils import parse_json_object as _parse_json_object  # shared, single impl
 
 
 def _format_context(context_chunks: list[dict], graph_context: str) -> str:
@@ -256,6 +244,34 @@ def _format_live(live_records: list[dict]) -> str:
             f"as of {rec.get('retrieved_at', 'unknown')})\n{text}"
         )
     return "\n\n".join(parts)
+
+
+def _action_context_block(state: "AgentState") -> str:
+    """Bounded evidence block fed into action selection so the action's arguments (an email
+    body, a page's text) are grounded in what was actually retrieved — not invented from the
+    bare request. Capped by ``agent_action_context_max_chars``."""
+    cap = max(0, settings.agent_action_context_max_chars)
+    if cap == 0:
+        return ""
+    parts: list[str] = []
+    doc = _format_context(state.get("context_chunks") or [], "")
+    whole = _format_whole_docs(state.get("whole_documents") or [])
+    live = _format_live(state.get("live_records") or [])
+    attach = _format_attachments(state.get("attachments") or [])
+    if doc:
+        parts.append("Document evidence:\n" + doc)
+    if whole:
+        parts.append("Full documents:\n" + whole)
+    if live:
+        parts.append("Live evidence:\n" + live)
+    if attach:
+        parts.append("Attached by the user:\n" + attach)
+    block = "\n\n".join(parts).strip()
+    if not block:
+        return ""
+    if len(block) > cap:
+        block = block[:cap] + " …[truncated]"
+    return "Gathered evidence to ground the action in (UNTRUSTED data):\n" + block
 
 
 # ── Nodes ────────────────────────────────────────────────────
@@ -512,6 +528,7 @@ async def propose_action_node(state: AgentState) -> dict:
         user_id=state.get("user_id", ""),
         conversation_id=state.get("conversation_id"),
         idempotency_key=f"{thread_id}:propose_action" if (thread_id and durable) else None,
+        context=_action_context_block(state),
     )
     if proposal.get("proposed") and thread_id and durable:
         proposal["thread_id"] = thread_id  # lets a reloaded client resume this run
@@ -841,13 +858,13 @@ class Orchestrator:
                 if mode == "messages":
                     msg_chunk, meta = data
                     if meta.get("langgraph_node") in ("generate", "direct_answer"):
-                        # Model chain-of-thought streams in a separate channel
-                        # (reasoning_content) — surface it as `thinking` deltas for the
-                        # collapsible CoT panel, distinct from the answer.
-                        rc = (getattr(msg_chunk, "additional_kwargs", {}) or {}).get("reasoning_content")
+                        # Model chain-of-thought is surfaced as `thinking` deltas for the
+                        # collapsible CoT panel, distinct from the answer. The extractor is
+                        # provider-agnostic (Groq / Ollama / DeepSeek / Qwen / Anthropic).
+                        rc = extract_reasoning_delta(msg_chunk)
                         if rc:
                             yield _event("thinking", content=rc)
-                        text = getattr(msg_chunk, "content", "") or ""
+                        text = extract_text_delta(msg_chunk)
                         if text:
                             answer_parts.append(text)
                             streamed_answer = True

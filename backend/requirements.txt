@@ -24,6 +24,11 @@ langchain-community>=0.3.14,<0.4
 langchain-google-genai>=2.0.8,<3.0
 langchain-groq>=0.3,<0.4
 langchain-text-splitters>=0.3.4,<0.4
+# Model-vendor-agnostic providers (each lazily imported by the model/embedding factory).
+# langchain-openai also powers the OpenAI-compatible vendors: deepseek, qwen, vllm.
+langchain-openai>=0.3,<0.4
+langchain-anthropic>=0.3,<0.4
+langchain-ollama>=0.2,<0.4
 
 # ── Agent Layer (orchestration) ──
 # LangGraph drives the orchestrator graph (intent classify → delegate → verify) and

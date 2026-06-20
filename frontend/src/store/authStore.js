@@ -40,6 +40,21 @@ export const useAuthStore = create(
         localStorage.setItem('access_token', accessToken);
       },
 
+      // Refresh the canonical user profile from the server (full_name, email, etc.).
+      // Merges into the existing user so role/username from login are preserved.
+      loadProfile: async () => {
+        try {
+          const me = await authService.getMe();
+          set((s) => ({ user: { ...s.user, ...me } }));
+          return me;
+        } catch {
+          return null;
+        }
+      },
+
+      // Apply a profile patch returned by the server to local state.
+      setUser: (patch) => set((s) => ({ user: { ...s.user, ...patch } })),
+
       logout: () => {
         const { refreshToken } = get();
         // Clear state immediately so the user is logged out instantly

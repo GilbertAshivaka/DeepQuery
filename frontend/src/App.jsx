@@ -12,6 +12,7 @@ import AdminPage from './pages/AdminPage';
 import DocumentViewerPage from './pages/DocumentViewerPage';
 import KnowledgeGraphPage from './pages/KnowledgeGraphPage';
 import CorpusExplorerPage from './pages/CorpusExplorerPage';
+import SettingsPage from './pages/SettingsPage';
 
 function ProtectedRoute({ children, roles }) {
   const { user, isAuthenticated } = useAuthStore();
@@ -106,6 +107,16 @@ export default function App() {
           }
         />
       </Route>
+
+      {/* Full-screen settings shell — outside the app Layout (no app sidebar) */}
+      <Route
+        path="settings"
+        element={
+          <ProtectedRoute>
+            <SettingsPage />
+          </ProtectedRoute>
+        }
+      />
 
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

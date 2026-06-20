@@ -42,6 +42,7 @@ import tasks.ingestion_task   # noqa: F401, E402
 import tasks.umap_task        # noqa: F401, E402
 import tasks.skill_sync_task  # noqa: F401, E402
 import tasks.agent_sweep_task  # noqa: F401, E402
+import tasks.reindex_task     # noqa: F401, E402
 
 # ── Beat schedule (periodic tasks) ──────────────────────────
 from celery.schedules import crontab

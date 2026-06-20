@@ -16,26 +16,28 @@ from google import genai
 from google.genai import types
 
 from core.config import settings
+from embeddings.base import Embedder
 
 logger = logging.getLogger(__name__)
 
 
-class GeminiEmbedder:
-    """Wrapper around Gemini Embedding 2 for all embedding operations.
+class GeminiEmbedder(Embedder):
+    """Gemini Embedding 2 — text, native image, and interleaved multimodal embedding.
 
-    Supports:
-    - Plain text embedding
-    - Image embedding (native, no OCR)
-    - Interleaved multimodal embedding (caption + image together)
-    """
+    The reference (and default) embedder. ``api_key`` / ``model`` / ``dimensions`` are
+    injected by the factory so the same class serves any Gemini embedding config."""
 
     MAX_RETRIES = 3
     BASE_BACKOFF = 2.0  # seconds
 
-    def __init__(self):
-        self.client = genai.Client(api_key=settings.google_api_key)
-        self.model_name = settings.embedding_model
-        self.dimensions = settings.embedding_dimensions
+    provider = "google"
+    supports_multimodal = True
+
+    def __init__(self, api_key: str = "", model: str = "", dimensions: int = 0):
+        self.client = genai.Client(api_key=api_key or settings.google_api_key)
+        self.model = model or settings.embedding_model
+        self.model_name = self.model  # back-compat alias
+        self.dimensions = dimensions or settings.embedding_dimensions
 
     def _embed_config(
         self, task_type: str = "RETRIEVAL_DOCUMENT"
@@ -206,55 +208,4 @@ class GeminiEmbedder:
         logger.error(f"Failed to embed multimodal content after {self.MAX_RETRIES} attempts.")
         return None
 
-    # ── Chunk dispatcher ──────────────────────────────────────
-
-    def embed_chunks(self, chunks) -> List[Optional[List[float]]]:
-        """Embed a list of DocumentChunk objects using the appropriate modality.
-
-        Routes each chunk to the correct embedding method:
-        - text → embed_texts_batch (batched)
-        - image → embed_image
-        - mixed → embed_multimodal
-        """
-        embeddings: List[Optional[List[float]]] = []
-
-        # Separate chunks by type for efficient batching
-        text_indices = []
-        text_contents = []
-
-        for i, chunk in enumerate(chunks):
-            if chunk.chunk_type == "image" and chunk.image_bytes:
-                emb = self.embed_image(chunk.image_bytes, chunk.image_format)
-                embeddings.append(emb)
-
-            elif chunk.chunk_type == "mixed" and chunk.image_bytes and chunk.text:
-                emb = self.embed_multimodal(
-                    chunk.text, chunk.image_bytes, chunk.image_format
-                )
-                embeddings.append(emb)
-
-            elif chunk.text.strip():
-                # Queue text chunks for batching
-                text_indices.append(i)
-                text_contents.append(chunk.text)
-                embeddings.append(None)  # placeholder
-
-            else:
-                embeddings.append(None)
-
-        # Batch embed text chunks (up to 100 per batch)
-        BATCH_SIZE = 100
-        for batch_start in range(0, len(text_contents), BATCH_SIZE):
-            batch_texts = text_contents[batch_start : batch_start + BATCH_SIZE]
-            batch_indices = text_indices[batch_start : batch_start + BATCH_SIZE]
-
-            batch_embeddings = self.embed_texts_batch(batch_texts)
-
-            for idx, emb in zip(batch_indices, batch_embeddings):
-                embeddings[idx] = emb
-
-        return embeddings
-
-
-# ── Module-level singleton ───────────────────────────────────
-gemini_embedder = GeminiEmbedder()
+    # embed_chunks() is inherited from Embedder (the dispatcher is provider-agnostic).

@@ -98,6 +98,22 @@ def set_connector_icon(db: Session, *, connector_id: str, icon_url: str) -> None
         db.commit()
 
 
+def set_connector_summary_if_empty(db: Session, *, connector_id: str, summary: str) -> bool:
+    """Persist a derived summary for a connector that has none yet (self-healing on the
+    discovery path), so the agent's connector pre-selection + planning have a real
+    description to reason about instead of a bare name. Never overwrites an admin-written
+    summary. Returns True if it wrote."""
+    summary = (summary or "").strip()
+    if not summary:
+        return False
+    row = db.query(Connector).filter(Connector.id == connector_id).first()
+    if row is None or (row.summary or "").strip():
+        return False  # missing, or already has a summary we must not clobber
+    row.summary = summary[:300]
+    db.commit()
+    return True
+
+
 def list_connector_refs(db: Session, *, enabled_only: bool = True) -> list[ConnectorRef]:
     q = db.query(Connector)
     if enabled_only:

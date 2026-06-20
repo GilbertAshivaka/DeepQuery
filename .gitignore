@@ -63,6 +63,12 @@ celerybeat.pid
 models/
 *.bin
 *.onnx
+# …but these are CODE packages named "models", not ML artifacts — keep them tracked.
+# (model blobs dropped inside still match the *.bin/*.onnx rules above.)
+!backend/models/
+!backend/models/**
+!backend/agents/models/
+!backend/agents/models/**
 
 # Byte-compiled
 *.pyc

@@ -1,8 +1,11 @@
 """
-Deep Query — Groq / Llama 3 Client
+Deep Query — Chat / RAG LLM Client
 
-All LLM calls go through Groq API using llama-3.3-70b-versatile.
-Supports: RAG generation, self-correction, entity extraction, metadata generation.
+The main user-facing chat path: RAG generation, self-correction, entity extraction,
+metadata generation. Provider-agnostic — every call resolves through the shared model
+factory via ``Slot.CHAT`` (``agents/models/slots.py``), so the vendor/model is a
+configuration choice (``agent_chat_provider`` / ``agent_chat_model``). Defaults preserve
+the historical behavior exactly: Groq Llama 3.3 70B.
 """
 
 import json
@@ -10,10 +13,10 @@ import logging
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_groq import ChatGroq
 
-from core.config import settings
+from agents.models import Slot, get_model
 from core.constants import LLM_TEMPERATURES
 from llm.prompts import (
     ENTITY_EXTRACTION_PROMPT,
@@ -27,29 +30,30 @@ logger = logging.getLogger(__name__)
 
 
 class GroqClient:
-    """Wrapper around Groq API for all LLM operations."""
+    """Chat/RAG LLM operations, routed through the provider-agnostic model factory.
+
+    (Name retained for back-compat with existing imports; the underlying provider is
+    no longer hard-wired to Groq — see ``Slot.CHAT``.)
+    """
 
     MAX_RETRIES = 3
     BASE_BACKOFF = 1.0
 
-    def __init__(self):
-        self.model = settings.llm_model
+    def _get_llm(
+        self, temperature: float, streaming: bool = False, slot: Slot = Slot.CHAT
+    ) -> BaseChatModel:
+        """Resolve the model for a given slot + temperature via the shared factory.
 
-    def _get_llm(self, temperature: float, streaming: bool = False) -> ChatGroq:
-        """Create a ChatGroq instance with specified settings."""
-        return ChatGroq(
-            model=self.model,
-            api_key=settings.groq_api_key,
-            temperature=temperature,
-            streaming=streaming,
-            max_tokens=4096,
-        )
+        The classic pipeline routes each workload to its own slot so they can be
+        configured to different vendors/models (generation vs. self-correction vs.
+        extraction)."""
+        return get_model(slot, streaming=streaming, temperature=temperature)
 
     def _call_with_retry(
-        self, messages: list, temperature: float
+        self, messages: list, temperature: float, slot: Slot = Slot.CHAT
     ) -> Optional[str]:
-        """Call LLM with retry and exponential backoff."""
-        llm = self._get_llm(temperature)
+        """Call the model for ``slot`` with retry and exponential backoff."""
+        llm = self._get_llm(temperature, slot=slot)
 
         for attempt in range(self.MAX_RETRIES):
             try:
@@ -58,14 +62,54 @@ class GroqClient:
             except Exception as e:
                 wait = self.BASE_BACKOFF * (2 ** attempt)
                 logger.warning(
-                    f"Groq API attempt {attempt + 1} failed: {e}. Retrying in {wait}s..."
+                    f"Chat LLM attempt {attempt + 1} failed: {e}. Retrying in {wait}s..."
                 )
                 time.sleep(wait)
 
-        logger.error(f"Groq API call failed after {self.MAX_RETRIES} attempts.")
+        logger.error(f"Chat LLM call failed after {self.MAX_RETRIES} attempts.")
         return None
 
     # ── RAG Generation ───────────────────────────────────────
+
+    @staticmethod
+    def _assemble_context(
+        context_chunks: List[Dict[str, Any]],
+        graph_context: str = "",
+        whole_documents: Optional[List[Dict[str, Any]]] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """Build the source context block — [Source N] passages, [Knowledge Graph Context],
+        [Doc N] full documents, [Attachment N] user files. Shared by the blocking and the
+        streaming generators so they never drift."""
+        parts = [
+            f"[Source {i}] (Document: {c.get('source', 'Unknown')}, "
+            f"Page: {c.get('page', 'N/A')})\n{c.get('text', '')}"
+            for i, c in enumerate(context_chunks, 1)
+        ]
+        context = "\n\n".join(parts)
+        if graph_context:
+            context += f"\n\n[Knowledge Graph Context]\n{graph_context}"
+        for i, w in enumerate(whole_documents or [], 1):
+            context += f"\n\n[Doc {i}] (Full document: {w.get('title', 'Unknown')})\n{w.get('text', '')}"
+        for i, att in enumerate(attachments or [], 1):
+            text = (att.get("text") or "").strip()
+            if text:
+                context += (
+                    f"\n\n[Attachment {i}] (User-provided: {att.get('filename', f'attachment-{i}')})\n{text}"
+                )
+        return context
+
+    @staticmethod
+    def _rag_messages(query: str, context: str, chat_history: Optional[list] = None) -> list:
+        """Assemble the prompt messages (system + prior turns + context/question)."""
+        messages = [SystemMessage(content=RAG_GENERATION_PROMPT)]
+        for turn in chat_history or []:
+            if turn.get("role") == "user":
+                messages.append(HumanMessage(content=turn.get("content", "")))
+            elif turn.get("role") == "assistant":
+                messages.append(SystemMessage(content=turn.get("content", "")))
+        messages.append(HumanMessage(content=f"Context:\n{context}\n\nQuestion: {query}"))
+        return messages
 
     def generate_answer(
         self,
@@ -73,80 +117,37 @@ class GroqClient:
         context_chunks: List[Dict[str, Any]],
         graph_context: str = "",
         chat_history: Optional[list] = None,
+        whole_documents: Optional[List[Dict[str, Any]]] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[str]:
-        """Generate a RAG answer with citations.
-
-        Args:
-            query: User's question.
-            context_chunks: List of dicts with 'text', 'source', 'page', 'summary'.
-            graph_context: Natural-language summary from knowledge graph traversal.
-
-        Returns:
-            Generated answer with [Source N] citations.
-        """
-        # Format context chunks for the prompt
-        formatted_sources = []
-        for i, chunk in enumerate(context_chunks, 1):
-            source_text = (
-                f"[Source {i}] (Document: {chunk.get('source', 'Unknown')}, "
-                f"Page: {chunk.get('page', 'N/A')})\n{chunk.get('text', '')}"
-            )
-            formatted_sources.append(source_text)
-
-        context = "\n\n".join(formatted_sources)
-        if graph_context:
-            context += f"\n\n[Knowledge Graph Context]\n{graph_context}"
-
-
-        # Build chat history for LLM prompt
-        messages = [SystemMessage(content=RAG_GENERATION_PROMPT)]
-        if chat_history:
-            for turn in chat_history:
-                if turn["role"] == "user":
-                    messages.append(HumanMessage(content=turn["content"]))
-                elif turn["role"] == "assistant":
-                    messages.append(SystemMessage(content=turn["content"]))
-        else:
-            messages.append(HumanMessage(content=f"Context:\n{context}\n\nQuestion: {query}"))
-
-        # Always append the context and current question as the last user message
-        if chat_history:
-            messages.append(HumanMessage(content=f"Context:\n{context}\n\nQuestion: {query}"))
-
-        return self._call_with_retry(
-            messages, LLM_TEMPERATURES["rag_generation"]
-        )
+        """Generate a RAG answer (blocking) with [Source N] / [Doc N] / [Attachment N]
+        citations. Kept for non-streaming callers; the chat endpoint streams instead."""
+        context = self._assemble_context(context_chunks, graph_context, whole_documents, attachments)
+        messages = self._rag_messages(query, context, chat_history)
+        return self._call_with_retry(messages, LLM_TEMPERATURES["rag_generation"])
 
     async def generate_answer_stream(
         self,
         query: str,
         context_chunks: List[Dict[str, Any]],
         graph_context: str = "",
+        chat_history: Optional[list] = None,
+        whole_documents: Optional[List[Dict[str, Any]]] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncGenerator[str, None]:
-        """Stream RAG answer tokens for SSE."""
-        formatted_sources = []
-        for i, chunk in enumerate(context_chunks, 1):
-            source_text = (
-                f"[Source {i}] (Document: {chunk.get('source', 'Unknown')}, "
-                f"Page: {chunk.get('page', 'N/A')})\n{chunk.get('text', '')}"
-            )
-            formatted_sources.append(source_text)
+        """Stream RAG answer tokens for SSE — same context/citations as ``generate_answer``,
+        emitted token-by-token so the chat shows text immediately (matching the agent).
+        Reasoning deltas (if the chat slot is a reasoning model) are dropped; only answer
+        text is yielded."""
+        from agents.models.reasoning import extract_text_delta
 
-        context = "\n\n".join(formatted_sources)
-        if graph_context:
-            context += f"\n\n[Knowledge Graph Context]\n{graph_context}"
-
-        llm = self._get_llm(
-            LLM_TEMPERATURES["rag_generation"], streaming=True
-        )
-        messages = [
-            SystemMessage(content=RAG_GENERATION_PROMPT),
-            HumanMessage(content=f"Context:\n{context}\n\nQuestion: {query}"),
-        ]
-
+        context = self._assemble_context(context_chunks, graph_context, whole_documents, attachments)
+        messages = self._rag_messages(query, context, chat_history)
+        llm = self._get_llm(LLM_TEMPERATURES["rag_generation"], streaming=True)
         async for chunk in llm.astream(messages):
-            if chunk.content:
-                yield chunk.content
+            text = extract_text_delta(chunk)
+            if text:
+                yield text
 
     # ── Self-Correction ──────────────────────────────────────
 
@@ -181,7 +182,7 @@ class GroqClient:
         ]
 
         response = self._call_with_retry(
-            messages, LLM_TEMPERATURES["self_correction"]
+            messages, LLM_TEMPERATURES["self_correction"], slot=Slot.SELF_CORRECTION
         )
 
         if response is None:
@@ -228,7 +229,7 @@ class GroqClient:
         ]
 
         response = self._call_with_retry(
-            messages, LLM_TEMPERATURES["entity_extraction"]
+            messages, LLM_TEMPERATURES["entity_extraction"], slot=Slot.EXTRACTION
         )
 
         if response is None:
@@ -265,7 +266,7 @@ class GroqClient:
         ]
 
         response = self._call_with_retry(
-            messages, LLM_TEMPERATURES["metadata_generation"]
+            messages, LLM_TEMPERATURES["metadata_generation"], slot=Slot.EXTRACTION
         )
 
         if response is None:
@@ -291,7 +292,7 @@ class GroqClient:
         ]
 
         response = self._call_with_retry(
-            messages, LLM_TEMPERATURES["entity_extraction"]
+            messages, LLM_TEMPERATURES["entity_extraction"], slot=Slot.EXTRACTION
         )
 
         if response is None:

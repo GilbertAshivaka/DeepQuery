@@ -99,8 +99,9 @@ def _resolve_affected(db, document_id: str, doc_text: str) -> list[tuple[SkillFi
 
     # Inferred — semantic similarity of changed content to fact-section content.
     if doc_text.strip():
-        from embeddings.gemini_embedder import gemini_embedder
-        doc_vec = gemini_embedder.embed_text(doc_text, task_type="RETRIEVAL_DOCUMENT")
+        from embeddings import get_embedder
+        embedder = get_embedder()
+        doc_vec = embedder.embed_text(doc_text, task_type="RETRIEVAL_DOCUMENT")
         if doc_vec:
             for skill in service.list_skills(db):
                 if skill.id in affected:
@@ -109,7 +110,7 @@ def _resolve_affected(db, document_id: str, doc_text: str) -> list[tuple[SkillFi
                     content = sec.get("content", "")
                     if not content.strip():
                         continue
-                    vec = gemini_embedder.embed_text(content, task_type="RETRIEVAL_DOCUMENT")
+                    vec = embedder.embed_text(content, task_type="RETRIEVAL_DOCUMENT")
                     if vec and _cosine(doc_vec, vec) >= INFERRED_THRESHOLD:
                         affected[skill.id] = (skill, "inferred")
                         break
