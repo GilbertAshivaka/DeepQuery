@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
 import {
-  X, Loader2, AlertCircle, User, Database, Link2, History, RotateCcw, Bot,
+  X, Loader2, AlertCircle, User, Database, Link2, History, RotateCcw, Bot, Pencil,
 } from 'lucide-react';
 import * as skillService from '../../services/skillService';
+import CreateSkillModal from './CreateSkillModal';
 
 /**
  * Skill file detail (UI guide §13). Visually separates the two content kinds —
@@ -32,6 +33,7 @@ export default function SkillDetailPanel({ skillId, onClose, onChanged }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [rollingBack, setRollingBack] = useState(null);
+  const [editing, setEditing] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -65,8 +67,23 @@ export default function SkillDetailPanel({ skillId, onClose, onChanged }) {
           <h3 className="font-semibold text-ink-900 text-sm truncate font-mono">{skill?.name || 'Skill'}</h3>
           {skill && <p className="text-[11px] text-sand-500">{skill.kind} · v{skill.current_version}</p>}
         </div>
-        <button onClick={onClose} className="btn-ghost !p-1" title="Close"><X size={18} /></button>
+        <div className="flex items-center gap-1 flex-shrink-0">
+          {skill && (
+            <button onClick={() => setEditing(true)} className="btn-ghost !p-1" title="Edit skill">
+              <Pencil size={15} />
+            </button>
+          )}
+          <button onClick={onClose} className="btn-ghost !p-1" title="Close"><X size={18} /></button>
+        </div>
       </div>
+
+      {editing && skill && (
+        <CreateSkillModal
+          skill={skill}
+          onClose={() => setEditing(false)}
+          onCreated={async () => { setEditing(false); await load(); onChanged?.(); }}
+        />
+      )}
 
       <div className="flex-1 overflow-y-auto p-5 space-y-5">
         {loading ? (

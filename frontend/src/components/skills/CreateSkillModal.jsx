@@ -4,16 +4,18 @@ import Modal from '../ui/Modal';
 import * as skillService from '../../services/skillService';
 
 /**
- * Create a skill file — either from structured fields or by pasting a full SKILL.md
- * (Anthropic Agent-Skills format). The name must be lowercase-hyphen, ≤64 chars,
- * and may not contain "claude"/"anthropic" (validated server-side).
+ * Create OR edit a skill file — from structured fields or by pasting a full SKILL.md
+ * (Anthropic Agent-Skills format). Pass `skill` to edit an existing one (name is locked —
+ * it's the trigger identity). The name must be lowercase-hyphen, ≤64 chars, and may not
+ * contain "claude"/"anthropic" (validated server-side).
  */
-export default function CreateSkillModal({ onClose, onCreated }) {
+export default function CreateSkillModal({ onClose, onCreated, skill = null }) {
+  const editing = !!skill;
   const [mode, setMode] = useState('fields'); // 'fields' | 'markdown'
-  const [name, setName] = useState('');
-  const [description, setDescription] = useState('');
-  const [kind, setKind] = useState('assistant');
-  const [body, setBody] = useState('');
+  const [name, setName] = useState(skill?.name || '');
+  const [description, setDescription] = useState(skill?.description || '');
+  const [kind, setKind] = useState(skill?.kind || 'assistant');
+  const [body, setBody] = useState(skill?.body || '');
   const [markdown, setMarkdown] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
@@ -22,28 +24,36 @@ export default function CreateSkillModal({ onClose, onCreated }) {
     setError(null);
     setBusy(true);
     try {
-      const payload =
-        mode === 'markdown'
-          ? { markdown }
-          : { name: name.trim(), description: description.trim(), kind, body };
-      const created = await skillService.createSkill(payload);
-      onCreated?.(created);
+      let saved;
+      if (editing) {
+        const payload = mode === 'markdown' ? { markdown } : { description: description.trim(), body };
+        saved = await skillService.updateSkill(skill.id, payload);
+      } else {
+        const payload =
+          mode === 'markdown'
+            ? { markdown }
+            : { name: name.trim(), description: description.trim(), kind, body };
+        saved = await skillService.createSkill(payload);
+      }
+      onCreated?.(saved);
     } catch (e) {
-      setError(e.response?.data?.detail || 'Could not create the skill.');
+      setError(e.response?.data?.detail || `Could not ${editing ? 'save' : 'create'} the skill.`);
       setBusy(false);
     }
   };
 
   return (
     <Modal
-      title="New skill file"
+      title={editing ? `Edit skill · ${skill.name}` : 'New skill file'}
       onClose={onClose}
       maxWidth="max-w-xl"
       footer={
         <>
           <button onClick={onClose} className="btn-secondary text-sm">Cancel</button>
           <button onClick={submit} disabled={busy} className="btn-primary text-sm">
-            {busy ? <><Loader2 size={15} className="animate-spin" /> Creating…</> : 'Create'}
+            {busy
+              ? <><Loader2 size={15} className="animate-spin" /> {editing ? 'Saving…' : 'Creating…'}</>
+              : (editing ? 'Save changes' : 'Create')}
           </button>
         </>
       }
@@ -71,24 +81,32 @@ export default function CreateSkillModal({ onClose, onCreated }) {
 
         {mode === 'fields' ? (
           <>
-            <Field label="Name (lowercase-hyphen, ≤64 chars)">
-              <input className="input font-mono text-xs" value={name} onChange={(e) => setName(e.target.value)} placeholder="marine-research-assistant" />
+            <Field label={editing ? 'Name (cannot be changed)' : 'Name (lowercase-hyphen, ≤64 chars)'}>
+              <input
+                className="input font-mono text-xs disabled:opacity-60"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                disabled={editing}
+                placeholder="marine-research-assistant"
+              />
             </Field>
             <Field label="Description (third-person — what it does and when)">
               <textarea className="input" rows={2} value={description} onChange={(e) => setDescription(e.target.value)} />
             </Field>
-            <Field label="Kind">
-              <input className="input" value={kind} onChange={(e) => setKind(e.target.value)} placeholder="assistant" />
-            </Field>
+            {!editing && (
+              <Field label="Kind">
+                <input className="input" value={kind} onChange={(e) => setKind(e.target.value)} placeholder="assistant" />
+              </Field>
+            )}
             <Field label="Instructions (human intent — Skill Sync never edits this)">
-              <textarea className="input font-mono text-xs" rows={6} value={body} onChange={(e) => setBody(e.target.value)} />
+              <textarea className="input font-mono text-xs" rows={editing ? 14 : 6} value={body} onChange={(e) => setBody(e.target.value)} />
             </Field>
           </>
         ) : (
-          <Field label="SKILL.md">
+          <Field label={editing ? 'SKILL.md (replaces body/description; name must match)' : 'SKILL.md'}>
             <textarea
               className="input font-mono text-xs"
-              rows={14}
+              rows={16}
               value={markdown}
               onChange={(e) => setMarkdown(e.target.value)}
               placeholder={'---\nname: my-skill\ndescription: …\n---\n\n# Instructions\n…'}

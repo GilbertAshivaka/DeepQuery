@@ -96,6 +96,19 @@ def fact_sections_of(skill: SkillFile) -> list[dict]:
     return _loads(skill.fact_sections, [])
 
 
+def delete_skill(db: Session, skill_id: str) -> None:
+    """Hard-delete a skill and its child rows (versions, dependencies, pending proposals).
+    Irreversible — admins use this to remove a skill outright (distinct from archiving)."""
+    skill = get_skill(db, skill_id)
+    if skill is None:
+        raise SkillError("skill not found")
+    db.query(SkillChangeProposal).filter(SkillChangeProposal.skill_id == skill_id).delete()
+    db.query(SkillDependency).filter(SkillDependency.skill_id == skill_id).delete()
+    db.query(SkillFileVersion).filter(SkillFileVersion.skill_id == skill_id).delete()
+    db.delete(skill)
+    db.commit()
+
+
 def list_versions(db: Session, skill_id: str) -> list[SkillFileVersion]:
     return (
         db.query(SkillFileVersion)

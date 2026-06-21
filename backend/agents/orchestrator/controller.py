@@ -444,6 +444,15 @@ async def controller_node(state: _g.AgentState) -> dict:
                 decision = {"type": "answer" if not state.get("answered") else "done",
                             "reason": "stall wrap-up", "step_label": "Answer with what I have"}
 
+    # One document per request. Once a deliverable exists, a further `produce` on the same
+    # run is almost always the model looping (write one, then another, then another) — wrap
+    # up gracefully instead. A genuinely different document is a fresh user request.
+    if decision.get("type") == "produce" and (state.get("deliverables") or []):
+        logger.info("controller: suppressing repeat produce (deliverable already exists)")
+        if writer:
+            writer({"type": "reasoning", "text": "The document's ready — I'll wrap up here."})
+        decision = {"type": "done", "reason": "document already produced"}
+
     narration = (decision.get("narration") or "").strip()
     if narration and writer:
         writer({"type": "reasoning", "text": narration})
@@ -634,7 +643,7 @@ async def produce_node(state: _g.AgentState) -> dict:
                              else "Fixing an issue and rebuilding the document…")})
             writer({"type": "produce_script_start", "step_id": step_id, "attempt": attempt})
         try:
-            script = await handler.generate_script(
+            script, language = await handler.generate_script(
                 request=request, findings=findings, loaded_skills=loaded_skills,
                 error=(last_error or None), on_delta=_on_delta)
         except Exception as exc:
@@ -643,9 +652,10 @@ async def produce_node(state: _g.AgentState) -> dict:
             continue
         if writer:
             # The cleaned, fence-stripped script — the UI swaps the streamed text for this
-            # final version and collapses the inline card to a `script.py` pill.
-            writer({"type": "produce_script_end", "step_id": step_id, "code": script})
-        result = await sandbox.run_sandbox(script, job)
+            # final version and collapses the inline card to a script pill (.py / .js).
+            writer({"type": "produce_script_end", "step_id": step_id,
+                    "code": script, "language": language})
+        result = await sandbox.run_sandbox(script, job, language=language)
         if not result.ok:
             last_error = result.error_digest()
             logger.info("produce attempt %s failed (%s)", attempt, result.classify())

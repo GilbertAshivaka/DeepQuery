@@ -232,7 +232,7 @@ def _cleanup_connections():
 
 app = FastAPI(
     title="Deep Query",
-    description="Semantic Knowledge Management Ecosystem — Pwani University",
+    description="Semantic Knowledge Management Ecosystem",
     version="0.1.0",
     lifespan=lifespan,
 )

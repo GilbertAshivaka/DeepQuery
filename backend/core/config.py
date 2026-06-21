@@ -288,7 +288,7 @@ class Settings(BaseSettings):
     agent_sandbox_runtime: str = "docker"
     # Prebaked toolchain image (built from backend/sandbox/Dockerfile). Pinned tag;
     # recorded in telemetry. Bump deliberately when the dep set changes.
-    agent_sandbox_image: str = "deepquery-doctools:0.2"
+    agent_sandbox_image: str = "deepquery-doctools:0.3"
     # Hard per-run resource limits (the blast-radius caps from §3.2).
     agent_sandbox_timeout_s: int = 120
     agent_sandbox_memory: str = "1g"
@@ -301,6 +301,10 @@ class Settings(BaseSettings):
     agent_sandbox_output_max_mb: int = 25
     # Repair loop (§5): max script-generation attempts before graceful degradation.
     agent_produce_max_attempts: int = 3
+    # Output-token ceiling for the document script-generation call. A long document/deck
+    # script easily exceeds the chat default (DEFAULT_MAX_TOKENS=4096) and truncates mid-
+    # script — every repair attempt then fails the same way. Give produce generous headroom.
+    agent_produce_max_output_tokens: int = 16000
 
     # ── Connector Infrastructure ─────────────────────────────
     # Fernet key for encrypting per-user connector credentials at rest. Generate

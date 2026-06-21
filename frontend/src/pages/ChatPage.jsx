@@ -195,7 +195,7 @@ export default function ChatPage() {
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder="Ask about Pwani University knowledge base…"
+                placeholder="Ask about your knowledge base…"
                 rows={1}
                 className="flex-1 resize-none min-h-[40px] max-h-32 py-2.5 px-3 bg-transparent
                   text-ink-900 placeholder:text-cream-400 text-sm
@@ -230,7 +230,7 @@ export default function ChatPage() {
               )}
             </div>
             <p className="text-[11px] text-cream-400 mt-2.5 text-center">
-              Deep Query uses RAG to answer from Pwani University documents. Always verify critical information.
+              Deep Query uses RAG to answer from your documents. Always verify critical information.
             </p>
           </form>
         </div>
@@ -276,7 +276,7 @@ const suggestions = [
   },
   {
     icon: Scale,
-    text: 'University examination policies',
+    text: 'Examination policies',
     color: 'text-forest-500 bg-forest-500/10',
   },
   {
@@ -316,7 +316,7 @@ function EmptyState({ onSuggestionClick }) {
         transition={{ delay: 0.25, duration: 0.4 }}
         className="text-ink-600 max-w-md mb-10"
       >
-        Ask questions about Pwani University's academic programs, policies,
+        Ask questions about your academic programs, policies,
         research, or any institutional knowledge.
       </motion.p>
 

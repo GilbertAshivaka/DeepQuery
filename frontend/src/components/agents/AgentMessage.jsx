@@ -195,22 +195,25 @@ function ScriptArtifacts({ scripts, onOpenCode }) {
   if (!scripts?.length) return null;
   return (
     <div className="mb-2 space-y-2">
-      {scripts.map((s) =>
-        s.streaming ? (
+      {scripts.map((s) => {
+        const isNode = s.language === 'node' || s.language === 'javascript';
+        const name = isNode ? 'script.js' : 'script.py';
+        const lang = isNode ? 'javascript' : 'python';
+        return s.streaming ? (
           <StreamingScriptCard key={s.stepId} code={s.code} />
         ) : (
           <button
             key={s.stepId}
-            onClick={() => onOpenCode?.({ code: s.code, title: 'script.py', language: 'python' })}
+            onClick={() => onOpenCode?.({ code: s.code, title: name, language: lang })}
             className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-cream-100 border border-cream-200
               text-xs text-ink-700 hover:bg-cream-200 hover:border-cream-300 active:scale-[0.98] transition-all"
             title="View the script that built the document"
           >
             <FileCode2 size={14} className="text-violet-500" />
-            <span className="font-mono">script.py</span>
+            <span className="font-mono">{name}</span>
           </button>
-        )
-      )}
+        );
+      })}
     </div>
   );
 }

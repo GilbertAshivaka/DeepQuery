@@ -23,6 +23,17 @@ export async function createSkill(body) {
   return data;
 }
 
+export async function updateSkill(skillId, body) {
+  // body: {description?, body?, metadata?} OR {markdown} — edits human intent (new version).
+  const { data } = await api.patch(`/api/skills/${skillId}`, body);
+  return data;
+}
+
+export async function deleteSkill(skillId) {
+  const { data } = await api.delete(`/api/skills/${skillId}`);
+  return data; // {status:'deleted', id}
+}
+
 export async function rollbackSkill(skillId, versionNo) {
   const { data } = await api.post(`/api/skills/${skillId}/rollback`, { version_no: versionNo });
   return data;

@@ -254,10 +254,12 @@ export const useAgentStore = create((set, get) => {
         break;
 
       case 'produce_script_end':
-        // Streaming done → swap in the cleaned script and collapse to a script.py pill.
+        // Streaming done → swap in the cleaned script and collapse to a script pill.
         patchTurn(turnId, (t) => {
           t.scripts = t.scripts.map((s) =>
-            s.stepId === event.step_id ? { ...s, code: event.code || s.code, streaming: false } : s);
+            s.stepId === event.step_id
+              ? { ...s, code: event.code || s.code, language: event.language || 'python', streaming: false }
+              : s);
         });
         break;
 
@@ -385,7 +387,7 @@ export const useAgentStore = create((set, get) => {
                 .map((a) => ({ filename: a.filename, download_url: `/api/agents/attachments/${a.id}/content` }))
             : [],
           // The build script(s) rehydrate as script.py pills (no longer streaming).
-          scripts: (t.cot?.scripts || []).map((s) => ({ stepId: s.step_id, code: s.code, streaming: false })),
+          scripts: (t.cot?.scripts || []).map((s) => ({ stepId: s.step_id, code: s.code, language: s.language || 'python', streaming: false })),
           created_at: t.created_at,
         }));
         set({ turns: loaded, isLoadingTurns: false });
@@ -610,7 +612,7 @@ export const useAgentStore = create((set, get) => {
         grounded: snap.grounded,
         skills: (snap.trace || []).filter((e) => e.kind === 'skill').map((e) => ({ name: e.name, version: e.version })),
         deliverables: snap.deliverables || [],
-        scripts: (snap.scripts || []).map((s) => ({ stepId: s.step_id, code: s.code || '', streaming: !!s.streaming })),
+        scripts: (snap.scripts || []).map((s) => ({ stepId: s.step_id, code: s.code || '', language: s.language || 'python', streaming: !!s.streaming })),
         approval: pa && !isBatch ? {
           thread_id: snap.thread_id, pending_id: pa.pending_id, connector: pa.connector,
           capability: pa.capability, preview: pa.preview, reasoning: pa.reasoning,

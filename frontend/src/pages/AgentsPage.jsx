@@ -44,6 +44,8 @@ export default function AgentsPage() {
   const [viewing, setViewing] = useState(null);        // {id, filename, kind} being viewed
   const [codeView, setCodeView] = useState(null);      // {code, title, language} in the code panel
   const bottomRef = useRef(null);
+  const scrollRef = useRef(null);     // thread scroll container
+  const pinnedRef = useRef(true);     // is the user pinned to the bottom (follow streaming)?
   const inputRef = useRef(null);
   const fileInputRef = useRef(null);
   const historyRef = useRef(null);
@@ -96,8 +98,16 @@ export default function AgentsPage() {
     };
   }, [reattachLiveRun]);
 
+  // Auto-scroll to follow streaming — but ONLY when the user is already near the bottom.
+  // If they've scrolled up (e.g. to read the script as it generates), don't yank them back.
+  // Instant ('auto') behaviour, since smooth-scroll fired on every stream delta is janky
+  // and fights the user.
+  const onThreadScroll = () => {
+    const el = scrollRef.current;
+    if (el) pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 140;
+  };
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (pinnedRef.current) bottomRef.current?.scrollIntoView({ behavior: 'auto' });
   }, [turns]);
 
   useEffect(() => {
@@ -238,7 +248,7 @@ export default function AgentsPage() {
         </div>
 
         {/* Thread */}
-        <div className="flex-1 overflow-y-auto px-4 md:px-8 py-6">
+        <div ref={scrollRef} onScroll={onThreadScroll} className="flex-1 overflow-y-auto px-4 md:px-8 py-6">
           <AnimatePresence mode="wait">
             {isLoadingTurns ? (
               <motion.div

@@ -74,7 +74,6 @@ export default function LoginPage() {
           <p className="text-ink-600 mt-1">
             Semantic Knowledge Management Ecosystem
           </p>
-          <p className="text-ink-600 text-sm">Pwani University</p>
         </div>
 
         {/* Login Card */}

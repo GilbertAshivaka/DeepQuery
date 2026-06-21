@@ -50,20 +50,29 @@ def mime_for(filename: str) -> str:
     return MIME_BY_EXT.get(Path(filename).suffix.lower(), "application/octet-stream")
 
 
-def _extract_code(raw: str) -> str:
-    """Pull the Python source out of the model reply — tolerate a ```python fence (or a
-    bare ``` fence) wrapping the script, else take the reply as-is."""
+def _norm_lang(label: str) -> str:
+    """Normalize a fence language tag to a supported runtime ('python' | 'node')."""
+    l = (label or "").strip().lower()
+    if l in ("js", "javascript", "node", "nodejs", "jsx", "mjs", "cjs"):
+        return "node"
+    return "python"
+
+
+def _extract_code(raw: str) -> tuple[str, str]:
+    """Pull the script out of the model reply and detect its language. Uses the fenced
+    block's info string (```python / ```javascript) as the language hint; defaults to
+    python. Returns (code, language)."""
     text = (raw or "").strip()
     if "```" in text:
-        # Take the content of the first fenced block.
         start = text.find("```")
         nl = text.find("\n", start)
         if nl != -1:
+            info = text[start + 3:nl].strip()
+            language = _norm_lang(info.split()[0]) if info else "python"
             rest = text[nl + 1:]
             end = rest.find("```")
-            if end != -1:
-                return rest[:end].strip()
-    return text
+            return (rest[:end] if end != -1 else rest).strip(), language
+    return text, "python"
 
 
 def _skill_instructions(loaded_skills: list[dict]) -> str:
@@ -91,12 +100,13 @@ class DocumentAgent:
         loaded_skills: Optional[list[dict]] = None,
         error: Optional[str] = None,
         on_delta=None,
-    ) -> str:
-        """Ask the GENERATION slot for a complete self-contained script. ``error`` (from a
-        prior sandbox failure) triggers the repair path — the same prompt plus the
-        classified failure, asking for the corrected whole script. When ``on_delta`` is
-        given, the reply is streamed and each text chunk is passed to it (the inline
-        script-streaming card); the cleaned, fence-stripped script is still returned."""
+    ) -> tuple[str, str]:
+        """Ask the GENERATION slot for a complete self-contained script. Returns
+        ``(code, language)`` where language is 'python' or 'node' (from the fenced block's
+        tag). ``error`` (from a prior sandbox failure) triggers the repair path — the same
+        prompt plus the classified failure, asking for the corrected whole script. When
+        ``on_delta`` is given, the reply is streamed and each text chunk is passed to it
+        (the inline script-streaming card); the cleaned script is still returned."""
         messages: list = [SystemMessage(content=SCRIPT_GENERATION_PROMPT)]
         instr = _skill_instructions(loaded_skills or [])
         if instr:
@@ -111,13 +121,14 @@ class DocumentAgent:
             human += SCRIPT_REPAIR_SUFFIX.format(error=error)
         messages.append(HumanMessage(content=human))
 
+        max_out = settings.agent_produce_max_output_tokens
         if on_delta is None:
-            resp = await get_model(Slot.GENERATION).ainvoke(messages)
+            resp = await get_model(Slot.GENERATION, max_tokens=max_out).ainvoke(messages)
             raw = resp.content if hasattr(resp, "content") else str(resp)
             return _extract_code(raw)
 
         parts: list[str] = []
-        async for chunk in get_model(Slot.GENERATION, streaming=True).astream(messages):
+        async for chunk in get_model(Slot.GENERATION, streaming=True, max_tokens=max_out).astream(messages):
             text = getattr(chunk, "content", "") or ""
             if text:
                 parts.append(text)

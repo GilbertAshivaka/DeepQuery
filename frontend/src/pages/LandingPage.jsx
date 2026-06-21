@@ -165,33 +165,6 @@ export default function LandingPage() {
         </div>
       </section>
 
-      {/* Stats / social proof */}
-      <section className="py-20 bg-gradient-to-b from-cream-50 to-cream-100">
-        <motion.div
-          initial={{ opacity: 0 }}
-          whileInView={{ opacity: 1 }}
-          viewport={{ once: true }}
-          transition={{ duration: 0.8 }}
-          className="max-w-4xl mx-auto px-6"
-        >
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-8 text-center">
-            {[
-              { label: 'Documents Indexed', value: '500+' },
-              { label: 'AI Responses', value: '10K+' },
-              { label: 'Knowledge Nodes', value: '2K+' },
-              { label: 'Active Users', value: '100+' },
-            ].map((stat) => (
-              <div key={stat.label}>
-                <p className="text-3xl font-bold text-amber-900 font-serif">
-                  {stat.value}
-                </p>
-                <p className="text-sm text-ink-600 mt-1">{stat.label}</p>
-              </div>
-            ))}
-          </div>
-        </motion.div>
-      </section>
-
       {/* CTA section */}
       <section className="py-24 px-6">
         <motion.div
@@ -216,7 +189,7 @@ export default function LandingPage() {
                 Ready to explore?
               </h2>
               <p className="text-ink-700 text-lg mb-8 max-w-lg mx-auto">
-                Sign in to start querying Pwani University's knowledge base
+                Sign in to start querying your knowledge base
                 with the power of AI.
               </p>
               <button

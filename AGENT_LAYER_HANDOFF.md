@@ -113,6 +113,16 @@ Read the guide for the authoritative spec; at a high level expect:
 - **No Alembic migrations** — connector tables get drop/recreated on schema change.
   If you add Agent-Layer tables, follow the existing `models/database.py` +
   `init_db()` pattern, or introduce Alembic (a noted future task).
+- **Deployment DB gotchas** (see `Deployment.md`):
+  - The dev `DATABASE_URL=sqlite:///./deepquery.db` resolves to `/app/deepquery.db`
+    — the container's *throwaway* layer, NOT the `sqlite_data` volume mounted at
+    `/app/data`. The prod compose now uses `sqlite:////app/data/deepquery.db`
+    (absolute, 4 slashes) on both `backend` and `celery-worker` so the DB survives
+    rebuild/redeploy. Don't revert this or every redeploy wipes all accounts/data.
+  - `_add_column_if_missing()` in `core/database.py` is **SQLite-only** (gated behind
+    `if sqlite`). When cutting over to Postgres those additive patches won't run.
+    Clean cutover: stand up empty Postgres → `init_db()`/`create_all` builds the full
+    schema from the models → migrate data in. That's the moment to finally adopt Alembic.
 - **SDK is published to PyPI at 1.1.1** (1.1.1 was a metadata-only fix over 1.1.0:
   corrected repo URLs). The backend venv has the 1.1.0 wheel installed locally —
   functionally identical; `pip install -U deepquery-sdk` picks up 1.1.1 anytime.

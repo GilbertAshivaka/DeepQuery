@@ -168,6 +168,7 @@ async def _drive_run(
                 s = next((x for x in scripts_acc if x.get("step_id") == sid), None)
                 if s is not None and event.get("code"):
                     s["code"] = event["code"]  # the cleaned, fence-stripped final script
+                    s["language"] = event.get("language") or "python"
             elif t == "done":
                 final = event
     except Exception as exc:

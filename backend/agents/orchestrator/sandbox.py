@@ -83,6 +83,10 @@ class SandboxResult:
             return ("The script exited 0 but wrote no file to /workspace/output/. Make sure it "
                     "saves the document to an absolute path under /workspace/output/.")
         tail = (self.stderr or self.stdout or "").strip()
+        # Drop Node's trailing "Node.js vX.Y.Z" footer — it's noise that buries the real
+        # error line for the repair loop.
+        lines = [ln for ln in tail.splitlines() if not ln.strip().startswith("Node.js v")]
+        tail = "\n".join(lines).strip()
         return tail[-4000:] if tail else f"The script exited with code {self.exit_code}."
 
 
@@ -93,17 +97,33 @@ def _mount(p: Path) -> str:
     return str(p.resolve())
 
 
-def _build_cmd(job_dir: Path, image: str) -> list[str]:
-    """The exact, proven flag set from backend/sandbox/README.md. Input is NOT mounted —
-    the script is self-contained (project decision); only the writable output dir and the
-    read-only script are bound."""
+# language → (script filename, in-container interpreter argv)
+_LANGS = {
+    "python": ("script.py", ["python", "/workspace/script.py"]),
+    "node": ("script.js", ["node", "/workspace/script.js"]),
+}
+
+
+def _lang(language: str) -> str:
+    """Normalize a language label to a supported runtime ('python' | 'node')."""
+    l = (language or "python").strip().lower()
+    if l in ("js", "javascript", "node", "nodejs"):
+        return "node"
+    return "python"
+
+
+def _build_cmd(job_dir: Path, image: str, language: str) -> list[str]:
+    """The exact, proven flag set from backend/sandbox/README.md, for the chosen runtime.
+    Input is NOT mounted — the script is self-contained (project decision); only the
+    writable output dir and the read-only script are bound."""
     runtime = (settings.agent_sandbox_runtime or "docker").strip()
+    fname, interp = _LANGS[_lang(language)]
     return [
         runtime, "run", "--rm",
         "--network=none",
         "--read-only", "--tmpfs", "/tmp",
         "-v", f"{_mount(job_dir / 'output')}:/workspace/output:rw",
-        "-v", f"{_mount(job_dir / 'script.py')}:/workspace/script.py:ro",
+        "-v", f"{_mount(job_dir / fname)}:/workspace/{fname}:ro",
         "--user", "1000:1000",
         "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges",
@@ -111,7 +131,7 @@ def _build_cmd(job_dir: Path, image: str) -> list[str]:
         "--cpus", str(settings.agent_sandbox_cpus),
         "--pids-limit", str(settings.agent_sandbox_pids_limit),
         image,
-        "python", "/workspace/script.py",
+        *interp,
     ]
 
 
@@ -119,22 +139,24 @@ async def run_sandbox(
     script: str,
     job_dir: Path,
     *,
+    language: str = "python",
     image: Optional[str] = None,
     timeout: Optional[int] = None,
 ) -> SandboxResult:
-    """Run a self-contained script in the sandbox and return the outcome + any files it
-    wrote to /workspace/output/. Writes ``script.py`` into ``job_dir`` and binds
-    ``job_dir/output`` as the only writable mount. Never raises for a script failure —
-    that's a SandboxResult with a nonzero exit (the repair loop's job); only genuinely
-    exceptional host conditions propagate."""
+    """Run a self-contained script (Python or Node) in the sandbox and return the outcome
+    + any files it wrote to /workspace/output/. Writes the script into ``job_dir`` under the
+    runtime's filename and binds ``job_dir/output`` as the only writable mount. Never raises
+    for a script failure — that's a SandboxResult with a nonzero exit (the repair loop's
+    job); only genuinely exceptional host conditions propagate."""
     image = image or settings.agent_sandbox_image
     timeout = timeout or settings.agent_sandbox_timeout_s
     job_dir = Path(job_dir)
     out_dir = job_dir / "output"
     out_dir.mkdir(parents=True, exist_ok=True)
-    (job_dir / "script.py").write_text(script, encoding="utf-8")
+    fname, _ = _LANGS[_lang(language)]
+    (job_dir / fname).write_text(script, encoding="utf-8")
 
-    cmd = _build_cmd(job_dir, image)
+    cmd = _build_cmd(job_dir, image, language)
     sem = await _acquire_slot()
     async with sem:
         try:

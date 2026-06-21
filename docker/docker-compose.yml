@@ -7,19 +7,23 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.backend
     container_name: deepquery-backend
-    ports:
-      - "8000:8000"
+    # No host port: nginx reaches it as `backend:8000` over deepquery-net.
+    # (To debug from the host, temporarily add `127.0.0.1:8000:8000` — loopback only.)
     env_file:
       - ../.env
     environment:
-      - DATABASE_URL=sqlite:///./deepquery.db
+      # Absolute path (4 slashes) so the SQLite file lives on the sqlite_data
+      # volume, not the throwaway container layer — survives rebuild/redeploy.
+      - DATABASE_URL=sqlite:////app/data/deepquery.db
       - CHROMA_HOST=chroma
       - CHROMA_PORT=8000
       - NEO4J_URI=bolt://neo4j:7687
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      # Durable agent checkpoints — without this it defaults to localhost in the
+      # container and resumable agents silently fall back to non-resumable.
+      - AGENT_REDIS_URL=redis://redis:6379/0
     volumes:
-      - ../backend:/app/backend
       - document_store:/app/document_store
       - sqlite_data:/app/data
     depends_on:
@@ -40,13 +44,15 @@ services:
     env_file:
       - ../.env
     environment:
+      # Must match the backend's DATABASE_URL — same file on the shared volume.
+      - DATABASE_URL=sqlite:////app/data/deepquery.db
       - CHROMA_HOST=chroma
       - CHROMA_PORT=8000
       - NEO4J_URI=bolt://neo4j:7687
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - AGENT_REDIS_URL=redis://redis:6379/0
     volumes:
-      - ../backend:/app/backend
       - document_store:/app/document_store
       - sqlite_data:/app/data
     depends_on:
@@ -65,8 +71,8 @@ services:
     image: redis:8-alpine
     container_name: deepquery-redis
     command: redis-server --appendonly yes --appendfsync everysec
-    ports:
-      - "6379:6379"
+    # NEVER publish Redis on a public host — unauthenticated Redis is a top scan
+    # target. Internal services reach it as `redis:6379` over deepquery-net.
     volumes:
       - redis_data:/data
     restart: unless-stopped
@@ -77,8 +83,7 @@ services:
   chroma:
     image: chromadb/chroma:latest
     container_name: deepquery-chroma
-    ports:
-      - "8100:8000"
+    # Internal only — reached as `chroma:8000` over deepquery-net.
     volumes:
       - chroma_data:/chroma/chroma
     environment:
@@ -92,11 +97,10 @@ services:
   neo4j:
     image: neo4j:5-community
     container_name: deepquery-neo4j
-    ports:
-      - "7474:7474"
-      - "7687:7687"
+    # Internal only — backend reaches it as `bolt://neo4j:7687`. To open the Neo4j
+    # browser, SSH-tunnel 7474/7687 rather than publishing them publicly.
     environment:
-      - NEO4J_AUTH=neo4j/deepquery_dev_password
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}
       - NEO4J_PLUGINS=["apoc"]
     volumes:
       - neo4j_data:/data
@@ -111,8 +115,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.frontend
     container_name: deepquery-frontend
-    ports:
-      - "5173:80"
+    # Internal only — nginx reaches it as `frontend:80` over deepquery-net.
     depends_on:
       - backend
     restart: unless-stopped

@@ -8,6 +8,7 @@ every Sync edit is human-gated here (guide §11).
 GET    /api/skills                          list skill files
 POST   /api/skills                          create a skill file
 GET    /api/skills/{id}                     detail + versions + dependencies
+PATCH  /api/skills/{id}                     edit body/description/metadata (new version)
 POST   /api/skills/{id}/rollback            roll back to a prior version
 POST   /api/skills/{id}/dependencies        declare a corpus dependency
 GET    /api/skills/proposals                list change proposals (default: pending)
@@ -72,6 +73,15 @@ class CreateSkillRequest(BaseModel):
     body: str = ""
     metadata: Optional[dict[str, Any]] = None
     # …or paste a full SKILL.md to parse.
+    markdown: Optional[str] = None
+
+
+class UpdateSkillRequest(BaseModel):
+    # Edit the human-intent content. Provide any subset of fields…
+    description: Optional[str] = None
+    body: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+    # …or paste a full SKILL.md to replace body/description/metadata at once.
     markdown: Optional[str] = None
 
 
@@ -196,6 +206,50 @@ def get_skill(skill_id: str, db: Session = Depends(get_db), _admin: User = Depen
         for d in deps
     ]
     return out
+
+
+@router.patch("/{skill_id}")
+def update_skill(skill_id: str, body: UpdateSkillRequest, db: Session = Depends(get_db), admin: User = Depends(admin_only)):
+    """Admin edit of a skill's human-intent content (body / description / metadata) — each
+    edit writes a new reversible version. The name is immutable (it's the trigger identity
+    and load_skill key); changing it would orphan references. Fact sections are maintained
+    by Skill Sync, not here."""
+    skill = service.get_skill(db, skill_id)
+    if skill is None:
+        raise HTTPException(status_code=404, detail="skill not found")
+    new_body, new_desc, new_meta = body.body, body.description, body.metadata
+    if body.markdown:
+        try:
+            parsed = parse_skill_markdown(body.markdown)
+        except SkillFormatError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if parsed["name"] != skill.name:
+            raise HTTPException(
+                status_code=400,
+                detail=f"the skill name can't be changed on edit (this skill is '{skill.name}'; "
+                       f"the pasted SKILL.md is '{parsed['name']}')",
+            )
+        new_body, new_desc, new_meta = parsed["body"], parsed["description"], parsed["metadata"]
+    if new_body is None and new_desc is None and new_meta is None:
+        raise HTTPException(status_code=400, detail="nothing to update")
+    try:
+        updated = service.update_human_intent(
+            db, skill_id, body=new_body, description=new_desc, metadata=new_meta, by=admin.id)
+    except service.SkillError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    out = _skill_out(updated)
+    out["body"] = updated.body
+    return out
+
+
+@router.delete("/{skill_id}")
+def delete_skill(skill_id: str, db: Session = Depends(get_db), _admin: User = Depends(admin_only)):
+    """Hard-delete a skill (and its versions/dependencies/proposals). Irreversible."""
+    try:
+        service.delete_skill(db, skill_id)
+    except service.SkillError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"status": "deleted", "id": skill_id}
 
 
 @router.post("/{skill_id}/rollback")

@@ -193,7 +193,7 @@ export default function SearchPage() {
               <Sparkles size={28} className="text-amber-900" />
             </div>
             <h3 className="font-semibold text-ink-900 mb-1">
-              Search Pwani University's knowledge base
+              Search your knowledge base
             </h3>
             <p className="text-ink-600 text-sm max-w-sm">
               Find academic programs, policies, research papers, and institutional documents

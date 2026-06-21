@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react';
 import { AnimatePresence } from 'framer-motion';
 import * as skillService from '../services/skillService';
+import { useAuthStore } from '../store/authStore';
 import CreateSkillModal from '../components/skills/CreateSkillModal';
 import SkillDetailPanel from '../components/skills/SkillDetailPanel';
 import SkillDiffReview from '../components/skills/SkillDiffReview';
 import {
-  ScrollText, Plus, Search, Loader2, Archive, GitBranch, CheckCircle2, AlertCircle, X,
+  ScrollText, Plus, Search, Loader2, Archive, GitBranch, CheckCircle2, AlertCircle, X, Trash2,
 } from 'lucide-react';
 
 export default function SkillsPage() {
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [tab, setTab] = useState('files');
   const [skills, setSkills] = useState([]);
   const [proposals, setProposals] = useState([]);
@@ -36,6 +38,19 @@ export default function SkillsPage() {
   }, []);
 
   const skillName = (id) => skills.find((s) => s.id === id)?.name;
+
+  const onDelete = async (s) => {
+    if (!window.confirm(`Delete the skill “${s.name}”? This removes it and its version history, and can't be undone.`)) return;
+    setBusyId(s.id);
+    try {
+      await skillService.deleteSkill(s.id);
+      if (detailId === s.id) setDetailId(null);
+      setNotice({ type: 'success', message: `Skill “${s.name}” deleted.` });
+      await loadSkills();
+    } catch (e) {
+      setNotice({ type: 'error', message: e.response?.data?.detail || 'Could not delete the skill.' });
+    } finally { setBusyId(null); }
+  };
 
   const onApprove = async (p) => {
     setBusyId(p.id);
@@ -119,10 +134,13 @@ export default function SkillsPage() {
           ) : tab === 'files' ? (
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
               {filteredSkills.length ? filteredSkills.map((s) => (
-                <button
+                <div
                   key={s.id}
+                  role="button"
+                  tabIndex={0}
                   onClick={() => setDetailId(s.id)}
-                  className={`card p-4 text-left hover:shadow-warm transition-all ${detailId === s.id ? 'ring-2 ring-violet-500/30' : ''}`}
+                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setDetailId(s.id); } }}
+                  className={`group relative card p-4 text-left hover:shadow-warm transition-all cursor-pointer ${detailId === s.id ? 'ring-2 ring-violet-500/30' : ''}`}
                 >
                   <div className="flex items-start justify-between gap-2 mb-1.5">
                     <h3 className="text-sm font-semibold text-ink-900 truncate font-mono">{s.name}</h3>
@@ -135,7 +153,19 @@ export default function SkillsPage() {
                       <GitBranch size={10} /> v{s.current_version}
                     </span>
                   </div>
-                </button>
+                  {/* Admin-only delete — revealed on hover */}
+                  {isAdmin && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); onDelete(s); }}
+                      disabled={busyId === s.id}
+                      className="absolute top-2 right-2 p-1.5 rounded-md text-ink-500 opacity-0 group-hover:opacity-100 focus:opacity-100
+                        hover:bg-terra-500/10 hover:text-terra-500 transition-all"
+                      title="Delete skill"
+                    >
+                      {busyId === s.id ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
+                    </button>
+                  )}
+                </div>
               )) : <EmptyNote>No skill files yet. Use “New skill” to create one.</EmptyNote>}
             </div>
           ) : (

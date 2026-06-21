@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
+from typing import Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
@@ -194,15 +195,18 @@ def _build_chat_model(
     streaming: bool,
     base_url: str | None = None,
     for_tools: bool = False,
+    max_tokens: Optional[int] = None,
 ) -> BaseChatModel:
     """Instantiate the LangChain chat model for a provider. Optional provider
     packages are imported lazily so a missing one only fails the slot that needs it.
 
     ``base_url`` (when set, e.g. from a DB config row) overrides the env default for
-    OpenAI / OpenAI-compatible providers. API keys resolve BYOK-first then managed env
-    (``provider_keys.resolve_api_key``)."""
+    OpenAI / OpenAI-compatible providers. ``max_tokens`` overrides the output-token
+    ceiling (produce script-generation needs far more than a chat answer). API keys
+    resolve BYOK-first then managed env (``provider_keys.resolve_api_key``)."""
     from agents.models import provider_keys  # lazy: avoids module-load cycle
 
+    out_tokens = max_tokens or DEFAULT_MAX_TOKENS
     if provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -213,6 +217,7 @@ def _build_chat_model(
             model=model,
             google_api_key=key,
             temperature=temperature,
+            **({"max_output_tokens": max_tokens} if max_tokens else {}),
         )
 
     if provider == "groq":
@@ -226,7 +231,7 @@ def _build_chat_model(
             api_key=key,
             temperature=temperature,
             streaming=streaming,
-            max_tokens=DEFAULT_MAX_TOKENS,
+            max_tokens=out_tokens,
             **_groq_quirks(model, for_tools=for_tools),
         )
 
@@ -241,7 +246,7 @@ def _build_chat_model(
         key = provider_keys.resolve_api_key("anthropic")
         if not key:
             raise ModelSlotError("No API key for provider 'anthropic' (set a BYOK key or anthropic_api_key).")
-        kwargs = dict(model=model, api_key=key, max_tokens=DEFAULT_MAX_TOKENS)
+        kwargs = dict(model=model, api_key=key, max_tokens=out_tokens)
         # Runtime-overridable via the Settings UI (app_settings flag), falling back to the
         # env default. A flag change bumps the config version, rebuilding this cached model.
         from agents.models import config_store  # lazy: avoids import cycle at module load
@@ -254,7 +259,7 @@ def _build_chat_model(
         if extended_thinking:
             # Extended thinking surfaces CoT as `thinking` content blocks. It requires
             # temperature=1 and a thinking budget strictly below max_tokens.
-            budget = max(1024, min(settings.agent_anthropic_thinking_budget, DEFAULT_MAX_TOKENS - 1024))
+            budget = max(1024, min(settings.agent_anthropic_thinking_budget, out_tokens - 1024))
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             kwargs["temperature"] = 1
         else:
@@ -305,7 +310,7 @@ def _build_chat_model(
             base_url=resolved_base_url,
             temperature=temperature,
             streaming=streaming,
-            max_tokens=DEFAULT_MAX_TOKENS,
+            max_tokens=out_tokens,
         )
 
     if provider == "ollama":
@@ -321,6 +326,8 @@ def _build_chat_model(
             base_url=settings.ollama_base_url,
             temperature=temperature,
         )
+        if max_tokens:
+            kwargs["num_predict"] = max_tokens  # Ollama's output-token cap
         # Enable local reasoning mode only for models that support it (else Ollama
         # errors). The CoT surfaces in additional_kwargs['reasoning_content'].
         if _is_reasoning_model(model):
@@ -340,7 +347,7 @@ _MODEL_CACHE: dict = {}
 
 def get_model(
     slot: Slot, streaming: bool = False, temperature: float | None = None,
-    for_tools: bool = False,
+    for_tools: bool = False, max_tokens: int | None = None,
 ) -> BaseChatModel:
     """Resolve and cache the chat model for a slot.
 
@@ -355,6 +362,9 @@ def get_model(
         for_tools: Build the model for native tool-calling (``bind_tools``). For Groq
             gpt-oss this drops the parsed-reasoning quirk, which is incompatible with
             tool calls. The returned model is otherwise identical; bind tools on it.
+        max_tokens: Optional output-token ceiling override. When ``None`` the provider
+            default (``DEFAULT_MAX_TOKENS``) is used. Produce script-generation passes a
+            much larger value — a long document script truncates at the chat default.
 
     Returns:
         A ready-to-use LangChain ``BaseChatModel``.
@@ -366,20 +376,21 @@ def get_model(
     from agents.models import config_store  # lazy import (avoids module-load cycle)
 
     version = config_store.current_version()
-    key = (slot, streaming, temperature, for_tools, version)
+    key = (slot, streaming, temperature, for_tools, max_tokens, version)
     cached = _MODEL_CACHE.get(key)
     if cached is not None:
         return cached
 
     # A new version means the config changed — drop entries from older versions.
-    if any(k[4] != version for k in _MODEL_CACHE):
-        for stale in [k for k in _MODEL_CACHE if k[4] != version]:
+    if any(k[5] != version for k in _MODEL_CACHE):
+        for stale in [k for k in _MODEL_CACHE if k[5] != version]:
             _MODEL_CACHE.pop(stale, None)
 
     provider, model, base_url, _params = _resolve_slot(slot)
     _assert_deployment_allows(provider, slot)
     temp = SLOT_TEMPERATURES[slot] if temperature is None else temperature
-    llm = _build_chat_model(provider, model, temp, streaming, base_url=base_url, for_tools=for_tools)
+    llm = _build_chat_model(provider, model, temp, streaming, base_url=base_url,
+                            for_tools=for_tools, max_tokens=max_tokens)
     _MODEL_CACHE[key] = llm
     logger.info(
         "Resolved model slot '%s' → provider=%s model=%s (streaming=%s, temperature=%s, v=%s)",
