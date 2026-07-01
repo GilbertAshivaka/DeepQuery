@@ -21,12 +21,14 @@ run_started/approval_required/done events) and the SAME run resumes via
 /threads/{id}/resume. The /actions/{pending_id}/approve|reject endpoints remain
 for the legacy non-durable fallback (Redis down) and the pre-resume UI.
 
-Event bus (phase R2 §2.5): every run also publishes its events to a per-run Redis
+Event bus (phase R2 §2.5): every run publishes its events to a per-run Redis
 Stream and maintains a snapshot, so /threads/{id}/events (replay + live tail via
 Last-Event-ID) and /threads/{id}/state (one-GET paint) give disconnect/multi-tab
-resilience. Execution is still in-request here; R3 moves it to an executor behind
-the same client contract. Bus writes are best-effort — the in-request SSE on /run
-is unaffected if Redis is briefly down.
+resilience. Execution is owned by the in-process executor (R3); the SSE on /run is
+purely a bus subscriber, so the bus is REQUIRED to start a run — /run fails fast
+with 503 when Redis is unreachable (a run started then would execute invisibly).
+Producer-side bus writes stay best-effort: a transient blip mid-run degrades
+streaming, not execution.
 """
 
 import json
@@ -79,6 +81,17 @@ async def run_agent(
     event bus. So if the client disconnects mid-run, the run keeps going, the assistant
     turn is still persisted, and the client can reattach via /threads/{id}/events.
     """
+    # Fail fast when the bus is down: the response below is only a bus subscriber, so a
+    # run started without Redis would execute invisibly (no stream, no reconnect, no
+    # resume). 503 is honest; nothing has been persisted yet.
+    from agents.orchestrator import event_bus
+
+    if not await event_bus.ping():
+        raise HTTPException(
+            status_code=503,
+            detail="agent runs are unavailable right now: the run event store (Redis) is unreachable",
+        )
+
     allowed_collections = [
         c.value for c in ROLE_COLLECTIONS.get(UserRole(user.role), [])
     ]
@@ -543,6 +556,55 @@ def _update_turn_gate(thread_id: str, **fields) -> None:
                 continue
             pa.update({k: v for k, v in fields.items() if v is not None})
             turn.proposed_action = json.dumps(pa)
+            sdb.commit()
+            break
+    except Exception:
+        sdb.rollback()
+    finally:
+        sdb.close()
+
+
+def _update_turn_batch(thread_id: str, results: list[dict]) -> None:
+    """Stamp a batch gate's resolution onto the turn that carries it (matched by the
+    thread_id folded into cot). Batch gates live in ``agent_trace`` (cot.batch), not the
+    ``proposed_action`` column, so ``_persist_action_resolution`` never matches them —
+    without this stamp a reloaded conversation re-shows the batch as still pending
+    (an already-resolved approval card asking again)."""
+    from core.database import SessionLocal
+
+    sdb = SessionLocal()
+    try:
+        for turn in (
+            sdb.query(AgentTurn)
+            .filter(AgentTurn.agent_trace.like(f"%{thread_id}%"))
+            .all()
+        ):
+            try:
+                cot = json.loads(turn.agent_trace) if turn.agent_trace else None
+            except Exception:
+                cot = None
+            if not (isinstance(cot, dict) and cot.get("thread_id") == thread_id
+                    and isinstance(cot.get("batch"), dict)):
+                continue
+            by_id = {r.get("pending_id"): r for r in results if r.get("pending_id")}
+            cot["batch"]["resolved"] = True
+            for a in cot["batch"].get("batch") or []:
+                r = by_id.get(a.get("pending_id"))
+                if r is not None:
+                    a["resolved_status"] = r.get("status")
+                    if r.get("error"):
+                        a["resolved_error"] = r.get("error")
+            # Advance the awaiting-approval plan step to a terminal status too (the
+            # single-gate path gets this via _persist_action_resolution).
+            statuses = [r.get("status") for r in results]
+            plan_status = ("done" if any(s == "executed" for s in statuses)
+                           else "rejected" if statuses and all(s == "rejected" for s in statuses)
+                           else "failed")
+            if isinstance(cot.get("plan"), list):
+                for step in cot["plan"]:
+                    if step.get("status") == "awaiting-approval":
+                        step["status"] = plan_status
+            turn.agent_trace = json.dumps(cot)
             sdb.commit()
             break
     except Exception:

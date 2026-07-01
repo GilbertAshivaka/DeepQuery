@@ -7,6 +7,9 @@ import {
   FileText,
   MessageSquare,
   Shield,
+  Bot,
+  Plug,
+  Puzzle,
   ArrowRight,
   Sparkles,
 } from 'lucide-react';
@@ -54,6 +57,27 @@ const features = [
     description:
       'Manage users, monitor analytics, track trending topics, and identify knowledge gaps.',
     color: 'amber',
+  },
+  {
+    icon: Bot,
+    title: 'Agentic Research',
+    description:
+      'Autonomous agents plan, retrieve across multiple sources, and act — pausing for your approval before anything consequential.',
+    color: 'violet',
+  },
+  {
+    icon: Plug,
+    title: 'Live Connectors',
+    description:
+      'Go beyond static documents. Connect live tools and data sources to ground answers in real-time information.',
+    color: 'forest',
+  },
+  {
+    icon: Puzzle,
+    title: 'Extensible Skills',
+    description:
+      'Package expertise as reusable skills the assistant loads on demand to tackle specialized tasks.',
+    color: 'terra',
   },
 ];
 

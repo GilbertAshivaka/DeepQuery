@@ -59,11 +59,14 @@ class RetrievalAgent:
         whole_doc_max_docs: int = 1,
         whole_doc_max_chars: int = 12000,
         attachments: Optional[list[dict]] = None,
+        hint: Optional[str] = None,
     ) -> dict[str, Any]:
         """Gather grounded context for a query.
 
         Runs the document path and (when ``want_live``) the live connector path in
-        parallel, then merges them.
+        parallel, then merges them. ``hint`` is the controller's planning note (why this
+        lookup was chosen) — passed to live tool selection so it picks and parameterizes
+        tools with the intent, not just the query text.
 
         Returns dict with: ``context_chunks``, ``live_records``, ``citations``
         (merged + tagged), ``graph_context``, ``chunks_retrieved``, ``live_count``,
@@ -87,7 +90,7 @@ class RetrievalAgent:
                 return {"records": [], "citations": [], "tool_activity": []}
             from agents.retrieval_agent.live import gather_live
             return await gather_live(
-                query=query, user_id=user_id, conversation_id=conversation_id
+                query=query, user_id=user_id, conversation_id=conversation_id, hint=hint
             )
 
         ctx, live = await asyncio.gather(_doc(), _live())

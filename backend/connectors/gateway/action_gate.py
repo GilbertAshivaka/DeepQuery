@@ -108,8 +108,11 @@ class ActionGate:
         return redis_client.get_json(_PREFIX + pending_id)
 
     def approve(self, pending_id: str, approver_id: str) -> str:
-        """Mark PREVIEWED -> APPROVED and mint a single-use approval token."""
+        """Mark PREVIEWED -> APPROVED and mint a single-use approval token. Only the
+        user the action was previewed FOR may approve it — this gate is the enforcer,
+        so ownership is checked here, not (only) in the calling layer."""
         rec = self._require(pending_id, "previewed")
+        self._require_owner(rec, approver_id)
         token = secrets.token_urlsafe(24)
         rec.update(status="approved", approver_id=approver_id, approval_token=token)
         redis_client.set_json(_PREFIX + pending_id, rec, ttl_seconds=_TTL_S)
@@ -117,9 +120,18 @@ class ActionGate:
 
     def reject(self, pending_id: str, approver_id: str) -> dict[str, Any]:
         rec = self._require(pending_id, "previewed")
+        self._require_owner(rec, approver_id)
         rec.update(status="rejected", approver_id=approver_id)
         redis_client.set_json(_PREFIX + pending_id, rec, ttl_seconds=_TTL_S)
         return rec
+
+    @staticmethod
+    def _require_owner(rec: dict[str, Any], approver_id: str) -> None:
+        """Refuse an approve/reject from anyone but the action's owner. A record with
+        no user_id (system-initiated preview) is exempt — nothing to compare against."""
+        owner = rec.get("user_id")
+        if owner and approver_id and str(owner) != str(approver_id):
+            raise ActionGateError("this action belongs to another user")
 
     def consume_for_execute(self, pending_id: str, approval_token: str) -> dict[str, Any]:
         """Verify the action is approved and the token matches, then consume it

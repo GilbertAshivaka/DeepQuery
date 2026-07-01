@@ -177,6 +177,12 @@ class Settings(BaseSettings):
     # arguments (e.g. a Gmail body) conform to the tool's schema. Falls back automatically
     # to the JSON path on any provider/parse failure. Set False to force the JSON path.
     agent_native_tool_calling: bool = True
+    # Emit the controller-loop decision as a provider-validated tool call instead of
+    # JSON-in-prose (schema-constrained; no parse/repair cycle). Opt-in: on Groq gpt-oss,
+    # tool-calling mode drops the parsed-reasoning channel, so the controller's thinking
+    # panel goes quiet on decision steps (narration is unaffected). Falls back to the
+    # JSON path automatically on any provider failure.
+    agent_controller_native_decision: bool = False
     # Cap (chars) on the gathered-evidence block fed into action selection so the model
     # grounds an action's arguments (the email body, the page content) in what was actually
     # retrieved, without blowing the prompt. 0 omits the evidence block.

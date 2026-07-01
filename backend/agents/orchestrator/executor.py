@@ -253,6 +253,8 @@ def _persist_assistant_turn(*, conversation_id, final, answer_parts, pending_app
         sdb.commit()
     except Exception:
         sdb.rollback()
+        logger.exception("failed to persist assistant turn (thread %s, conversation %s)",
+                         thread_id, conversation_id)
     finally:
         sdb.close()
 
@@ -299,7 +301,8 @@ async def _drive_resume(*, thread_id: str, decision: Optional[str], approver_id:
     and the R6 batch gate (``batch_decisions``). Persistence helpers live in the API layer
     (shared with the legacy approve/reject endpoints); imported lazily."""
     from agents.orchestrator import event_bus, orchestrator
-    from api.agents import _persist_action_resolution, _update_turn_gate, _update_turn_question
+    from api.agents import (_persist_action_resolution, _update_turn_batch,
+                            _update_turn_gate, _update_turn_question)
 
     # Record the user's answer on the originating question turn (so the resolved Q&A
     # rehydrates), regardless of how the continuation ends.
@@ -308,6 +311,7 @@ async def _drive_resume(*, thread_id: str, decision: Optional[str], approver_id:
 
     final: dict = {}
     action_res: dict = {}
+    action_results: list[dict] = []  # ALL per-action outcomes (batch stamping needs each)
     regate: dict = {}
     try:
         async for event in orchestrator.resume(
@@ -318,6 +322,7 @@ async def _drive_resume(*, thread_id: str, decision: Optional[str], approver_id:
             t = event.get("type")
             if t == "action_result":
                 action_res = event  # last one wins; the combined report is final.answer
+                action_results.append(event)
             elif t in ("approval_required", "batch_approval_required"):
                 regate = event
             elif t == "done":
@@ -336,6 +341,11 @@ async def _drive_resume(*, thread_id: str, decision: Optional[str], approver_id:
             error=action_res.get("error"),
             thread_id=thread_id,
         )
+        if batch_decisions:
+            # Batch gates live in cot.batch (not proposed_action) — stamp their
+            # resolution so a reloaded conversation shows the resolved plan, not a
+            # still-pending approval card.
+            _update_turn_batch(thread_id, action_results)
         # Prefer the run's final answer (the combined batch report, or the single report).
         message = final.get("answer") or action_res.get("message")
         conv_id = final.get("conversation_id")

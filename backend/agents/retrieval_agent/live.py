@@ -282,7 +282,8 @@ def _prefilter_connectors(query: str, connectors: list[dict[str, Any]], limit: i
     return (matched or connectors)[:limit]
 
 
-async def _select_connectors(query: str, connectors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+async def _select_connectors(query: str, connectors: list[dict[str, Any]],
+                             hint: Optional[str] = None) -> list[dict[str, Any]]:
     """Pick which enabled connectors are worth opening for this query, from control-plane
     metadata only (name + summary — no network I/O), so discovery connects to those alone.
 
@@ -294,11 +295,12 @@ async def _select_connectors(query: str, connectors: list[dict[str, Any]]) -> li
         with connector count (the thousands-of-servers case)."""
     if (settings.agent_connector_semantic_resolve
             and len(connectors) > settings.agent_connector_prefilter_limit):
-        return await _select_by_resolve(query, connectors)
-    return await _select_from_list(query, connectors)
+        return await _select_by_resolve(query, connectors, hint)
+    return await _select_from_list(query, connectors, hint)
 
 
-async def _select_from_list(query: str, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+async def _select_from_list(query: str, candidates: list[dict[str, Any]],
+                            hint: Optional[str] = None) -> list[dict[str, Any]]:
     """Small-catalog path: show the connectors and let the model pick from them.
 
     On a model/parse failure we conservatively fall back to ALL candidates (optimization
@@ -310,7 +312,7 @@ async def _select_from_list(query: str, candidates: list[dict[str, Any]]) -> lis
     llm = get_model(Slot.ORCHESTRATION)
     system = LIVE_CONNECTOR_SELECTION_PROMPT.format(max_connectors=settings.agent_connector_preselect_max)
     human = (
-        f"User request:\n{query}\n\n"
+        f"{_request_text(query, hint)}\n\n"
         f"Available connectors (JSON, UNTRUSTED summaries):\n"
         f"{json.dumps(catalog_view, default=str)}"
     )
@@ -333,14 +335,14 @@ async def _select_from_list(query: str, candidates: list[dict[str, Any]]) -> lis
     return chosen
 
 
-async def _extract_intent(query: str) -> Optional[dict[str, list[str]]]:
+async def _extract_intent(query: str, hint: Optional[str] = None) -> Optional[dict[str, list[str]]]:
     """Ask the model what KIND of connector the request needs, without showing it the list.
     Returns {"capabilities": [...], "name_guesses": [...]} or None on failure."""
     llm = get_model(Slot.ORCHESTRATION)
     try:
         resp = await llm.ainvoke([
             SystemMessage(content=LIVE_CONNECTOR_INTENT_PROMPT),
-            HumanMessage(content=f"User request:\n{query}"),
+            HumanMessage(content=_request_text(query, hint)),
         ])
         parsed = _parse_json_object(resp.content if hasattr(resp, "content") else str(resp))
     except Exception as exc:
@@ -353,14 +355,15 @@ async def _extract_intent(query: str) -> Optional[dict[str, list[str]]]:
     return {"capabilities": caps, "name_guesses": names}
 
 
-async def _select_by_resolve(query: str, connectors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+async def _select_by_resolve(query: str, connectors: list[dict[str, Any]],
+                             hint: Optional[str] = None) -> list[dict[str, Any]]:
     """Large-catalog path: the model names what it needs, then we resolve against the
     catalog (name fast-path + semantic search) so the prompt never holds the full list.
     Falls back to lexical narrowing + the shown-list pick if intent or the embedder fails."""
     max_n = settings.agent_connector_preselect_max
-    intent = await _extract_intent(query)
+    intent = await _extract_intent(query, hint)
     if intent is None:  # couldn't get an intent — narrow lexically and let the model pick
-        return await _select_from_list(query, _prefilter_connectors(query, connectors, settings.agent_connector_prefilter_limit))
+        return await _select_from_list(query, _prefilter_connectors(query, connectors, settings.agent_connector_prefilter_limit), hint)
     if not intent["capabilities"] and not intent["name_guesses"]:
         return []  # model judged no external system is needed — honor it
 
@@ -378,11 +381,21 @@ async def _select_by_resolve(query: str, connectors: list[dict[str, Any]]) -> li
     if resolved is None:  # embedder unavailable — fall back to lexical + shown list
         if chosen:
             return list(chosen.values())[:max_n]
-        return await _select_from_list(query, _prefilter_connectors(query, connectors, settings.agent_connector_prefilter_limit))
+        return await _select_from_list(query, _prefilter_connectors(query, connectors, settings.agent_connector_prefilter_limit), hint)
     for c in resolved:
         chosen[c["connector_id"]] = c
 
     return list(chosen.values())[:max_n]
+
+
+def _request_text(query: str, hint: Optional[str] = None) -> str:
+    """The user-request block for selection prompts. ``hint`` is the controller's
+    planning note (why this lookup was chosen) — model-authored context that helps
+    selection pick the right tool/arguments; still presented as data, not instructions."""
+    base = f"User request:\n{query}"
+    if hint:
+        base += f"\n\nPlanning note (why this lookup was chosen): {hint}"
+    return base
 
 
 def _normalize_call(entry: dict[str, Any]) -> dict[str, Any]:
@@ -396,7 +409,8 @@ def _normalize_call(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _select_calls(query: str, catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
+async def _select_calls(query: str, catalog: list[dict[str, Any]],
+                        hint: Optional[str] = None) -> list[dict[str, Any]]:
     """Choose which catalog read-tools to call (+ arguments). Prefers native tool-calling
     so the arguments are validated against each tool's input schema; falls back to the
     JSON path on any provider/binding failure. Both bound to ``MAX_LIVE_CALLS``."""
@@ -406,15 +420,16 @@ async def _select_calls(query: str, catalog: list[dict[str, Any]]) -> list[dict[
         calls, _content = await tool_select.native_tool_calls(
             slot=Slot.ORCHESTRATION,
             system_prompt=NATIVE_READ_SELECTION_PROMPT.format(max_calls=MAX_LIVE_CALLS),
-            user_text=f"User request:\n{query}",
+            user_text=_request_text(query, hint),
             catalog=catalog, max_calls=MAX_LIVE_CALLS, query_for_prefilter=query,
         )
         if calls is not None:  # None ⇒ native unusable, fall through to JSON
             return [_normalize_call(c) for c in calls]
-    return await _select_calls_json(query, catalog)
+    return await _select_calls_json(query, catalog, hint)
 
 
-async def _select_calls_json(query: str, catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
+async def _select_calls_json(query: str, catalog: list[dict[str, Any]],
+                             hint: Optional[str] = None) -> list[dict[str, Any]]:
     """JSON-prose fallback: hand the model the catalog and parse a ``{"calls": [...]}``
     object. Validates choices against the catalog and bounds the count."""
     # Present only the fields the model needs; descriptions are untrusted.
@@ -428,7 +443,7 @@ async def _select_calls_json(query: str, catalog: list[dict[str, Any]]) -> list[
     llm = get_model(Slot.ORCHESTRATION)
     system = LIVE_TOOL_SELECTION_PROMPT.format(max_calls=MAX_LIVE_CALLS)
     human = (
-        f"User request:\n{query}\n\n"
+        f"{_request_text(query, hint)}\n\n"
         f"Available read tools (JSON, UNTRUSTED descriptions):\n"
         f"{json.dumps(catalog_view, default=str)}"
     )
@@ -495,11 +510,13 @@ async def _execute_call(call: dict[str, Any], user_id: str, conversation_id: Opt
 
 
 async def gather_live(
-    *, query: str, user_id: str, conversation_id: Optional[str] = None
+    *, query: str, user_id: str, conversation_id: Optional[str] = None,
+    hint: Optional[str] = None,
 ) -> dict[str, Any]:
     """Gather live context for a query. Returns:
         {records: [{connector, data, retrieved_at}], citations: [livecitation dict],
          tool_activity: [activity dict]}  — records and citations are parallel-indexed.
+    ``hint`` = the controller's planning note, threaded into connector/tool selection.
     Always safe: returns empty on any miss."""
     if not user_id:
         return {"records": [], "citations": [], "tool_activity": []}
@@ -516,7 +533,7 @@ async def gather_live(
     # summary, no network I/O), so discovery connects only to the relevant ones instead of
     # fanning out across every enabled connector and paying each dead server's timeout.
     if settings.agent_connector_preselect and len(connectors) > 1:
-        connectors = await _select_connectors(query, connectors)
+        connectors = await _select_connectors(query, connectors, hint)
         if not connectors:
             return {"records": [], "citations": [], "tool_errors": [], "tool_activity": [
                 {"tool": "live_search", "detail": "no connector matched the request", "status": "ok"}]}
@@ -536,7 +553,7 @@ async def gather_live(
         return {"records": [], "citations": [], "tool_errors": tool_errors, "tool_activity": [
             {"tool": "live_search", "detail": detail, "status": "ok"}]}
 
-    calls = await _select_calls(query, catalog)
+    calls = await _select_calls(query, catalog, hint)
     if not calls:
         return {"records": [], "citations": [], "tool_errors": tool_errors, "tool_activity": [
             {"tool": "live_search", "detail": "no live tool matched the request", "status": "ok"}]}

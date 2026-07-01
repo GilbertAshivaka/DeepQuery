@@ -165,6 +165,8 @@ class AgentState(TypedDict, total=False):
     approval_decision: str       # "approve" | "reject" (from the resume payload)
     approver_id: str
     action_result: dict          # outcome of resolve_action (executed/rejected/failed)
+    executed_actions: list[dict]  # actions resolved this run [{connector,capability,target,status}]
+                                  # — the repeat-act guard (an executed action is never re-proposed)
     # Controller loop (RESUMABLE_AGENT_SPEC_V2 §2.2, phase R4)
     findings: list[str]          # distilled evidence summaries accumulated across reads
     decision: dict               # the controller's current structured decision
@@ -172,6 +174,9 @@ class AgentState(TypedDict, total=False):
     answered: bool               # an answer segment has been produced
     # Context discipline + sprawl control (spec §2.7–2.8, R5)
     artifact_refs: list[str]     # refs to raw read payloads offloaded to the artifact store
+    source_seq: int              # global [Source N] counter (stable across merged reads)
+    live_seq: int                # global [Live N] counter
+    doc_seq: int                 # global [Doc N] counter (whole-document expansions)
     read_signatures: list[str]   # source-signatures of executed reads (duplicate detection)
     no_progress_count: int       # consecutive reads that added no new evidence (stall)
     stall_replans: int           # forced re-plans so far (escalates to wrap-up)
@@ -202,11 +207,14 @@ from agents.json_utils import parse_json_object as _parse_json_object  # shared,
 
 def _format_context(context_chunks: list[dict], graph_context: str) -> str:
     """Format chunks as [Source N] blocks — matching the chat path so [Source N]
-    citation numbering aligns with the citation objects."""
+    citation numbering aligns with the citation objects. A chunk that carries a stored
+    ``source_number`` (controller loop: stable global numbering across merged reads)
+    keeps it; otherwise numbering is positional (fixed pipeline: one read per run)."""
     parts = []
     for i, chunk in enumerate(context_chunks, 1):
+        n = chunk.get("source_number", i)
         parts.append(
-            f"[Source {i}] (Document: {chunk.get('source', 'Unknown')}, "
+            f"[Source {n}] (Document: {chunk.get('source', 'Unknown')}, "
             f"Page: {chunk.get('page', 'N/A')})\n{chunk.get('text', '')}"
         )
     context = "\n\n".join(parts)
@@ -216,10 +224,12 @@ def _format_context(context_chunks: list[dict], graph_context: str) -> str:
 
 
 def _format_whole_docs(whole_documents: list[dict]) -> str:
-    """Format full corpus documents as [Doc N] blocks."""
+    """Format full corpus documents as [Doc N] blocks (stored ``doc_number`` preferred —
+    stable across the controller loop's merged reads; positional otherwise)."""
     parts = []
     for i, w in enumerate(whole_documents, 1):
-        parts.append(f"[Doc {i}] (Full document: {w.get('title', 'Unknown')})\n{w.get('text', '')}")
+        n = w.get("doc_number", i)
+        parts.append(f"[Doc {n}] (Full document: {w.get('title', 'Unknown')})\n{w.get('text', '')}")
     return "\n\n".join(parts)
 
 

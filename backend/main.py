@@ -65,6 +65,18 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Agent run reconciliation skipped: %s", exc)
 
+    # 6. Single-worker contract (RESUMABLE_AGENT_SPEC_V2 §5): the agent executor and the
+    # SSE subscribers' is_running() check track live runs IN-PROCESS. With >1 worker,
+    # subscribers land on a worker that isn't executing the run and stop tailing it as
+    # "dead". Best-effort detection — gunicorn/uvicorn expose the count via env.
+    import os as _os
+    _workers = _os.environ.get("WEB_CONCURRENCY") or _os.environ.get("UVICORN_WORKERS") or ""
+    if _workers.isdigit() and int(_workers) > 1:
+        logger.error(
+            "Deep Query requires a SINGLE worker process (detected %s): agent run "
+            "tracking and SSE liveness checks are in-process. Set workers=1, or agent "
+            "streaming/resume will misbehave.", _workers)
+
     print("=" * 60)
     print("✓ Server ready to accept traffic")
     print("=" * 60)

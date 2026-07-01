@@ -112,14 +112,15 @@ def _lang(language: str) -> str:
     return "python"
 
 
-def _build_cmd(job_dir: Path, image: str, language: str) -> list[str]:
+def _build_cmd(job_dir: Path, image: str, language: str, name: str) -> list[str]:
     """The exact, proven flag set from backend/sandbox/README.md, for the chosen runtime.
     Input is NOT mounted — the script is self-contained (project decision); only the
-    writable output dir and the read-only script are bound."""
+    writable output dir and the read-only script are bound. The container is NAMED so a
+    timeout can kill the container itself (killing the CLI client does not stop it)."""
     runtime = (settings.agent_sandbox_runtime or "docker").strip()
     fname, interp = _LANGS[_lang(language)]
     return [
-        runtime, "run", "--rm",
+        runtime, "run", "--rm", "--name", name,
         "--network=none",
         "--read-only", "--tmpfs", "/tmp",
         "-v", f"{_mount(job_dir / 'output')}:/workspace/output:rw",
@@ -135,6 +136,18 @@ def _build_cmd(job_dir: Path, image: str, language: str) -> list[str]:
     ]
 
 
+async def _remove_container(runtime: str, name: str) -> None:
+    """Force-remove a (possibly still running) sandbox container. Best-effort: if it
+    already exited (--rm cleaned it up), the command fails harmlessly."""
+    try:
+        killer = await asyncio.create_subprocess_exec(
+            runtime, "rm", "-f", name,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await asyncio.wait_for(killer.wait(), timeout=15)
+    except Exception as exc:
+        logger.warning("could not remove timed-out sandbox container %s: %s", name, exc)
+
+
 async def run_sandbox(
     script: str,
     job_dir: Path,
@@ -148,6 +161,8 @@ async def run_sandbox(
     runtime's filename and binds ``job_dir/output`` as the only writable mount. Never raises
     for a script failure — that's a SandboxResult with a nonzero exit (the repair loop's
     job); only genuinely exceptional host conditions propagate."""
+    import uuid
+
     image = image or settings.agent_sandbox_image
     timeout = timeout or settings.agent_sandbox_timeout_s
     job_dir = Path(job_dir)
@@ -156,7 +171,9 @@ async def run_sandbox(
     fname, _ = _LANGS[_lang(language)]
     (job_dir / fname).write_text(script, encoding="utf-8")
 
-    cmd = _build_cmd(job_dir, image, language)
+    runtime = (settings.agent_sandbox_runtime or "docker").strip()
+    name = f"dq-sandbox-{uuid.uuid4().hex[:12]}"
+    cmd = _build_cmd(job_dir, image, language, name)
     sem = await _acquire_slot()
     async with sem:
         try:
@@ -178,6 +195,9 @@ async def run_sandbox(
             except ProcessLookupError:
                 pass
             await proc.wait()
+            # Killing the CLI client leaves the container running — remove it by name
+            # so a looping script can't outlive its own timeout.
+            await _remove_container(runtime, name)
 
     stdout = stdout_b.decode("utf-8", "replace")[:_CAP_BYTES] if stdout_b else ""
     stderr = stderr_b.decode("utf-8", "replace")[:_CAP_BYTES] if stderr_b else ""

@@ -9,11 +9,13 @@ Every event a run emits is appended to a per-run **Redis Stream**
 ``/events`` from a ``Last-Event-ID``, getting replay-then-live for free — so reconnects,
 multi-tab, and returning to an awaiting-approval run all work without re-running anything.
 
-The bus is **best-effort for producers**: if Redis is unreachable, ``publish``/``init_run``
-log and no-op so the in-request SSE stream (which still flows directly to the client)
-never breaks. Consumers (``/events``/``/state``) require the bus and surface a clean error
-when it's unavailable. Keys live on db 0 (shared with the checkpointer; AOF on) and carry
-a TTL so abandoned runs expire (full sweeper is a later phase).
+Since R3 the client stream on ``/run`` is a bus subscriber (execution lives in the
+executor), so the bus is REQUIRED to *start* a run — ``/run`` checks ``ping()`` and fails
+fast when Redis is unreachable, rather than executing invisibly. Producer-side writes
+remain **best-effort**: a transient Redis blip mid-run degrades streaming, not execution
+(``publish``/``init_run`` log and no-op). Consumers (``/events``/``/state``) require the
+bus and surface a clean error when it's unavailable. Keys live on db 0 (shared with the
+checkpointer; AOF on) and carry a TTL so abandoned runs expire.
 """
 
 from __future__ import annotations
@@ -195,6 +197,17 @@ def _fold(snap: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
 
 
 # ── Producer API (best-effort) ───────────────────────────────
+
+async def ping() -> bool:
+    """Whether the bus (Redis) is reachable. ``/run`` refuses to start a run without it —
+    execution streams only via the bus (R3), so a run started with Redis down would
+    execute invisibly."""
+    try:
+        client = await _get_client()
+        return bool(await client.ping())
+    except Exception:
+        return False
+
 
 async def init_run(thread_id: str, user_id: str) -> None:
     """Seed the snapshot with the run's owner before the first event (so /state and
