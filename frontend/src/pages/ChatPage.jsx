@@ -7,7 +7,7 @@ import SourceDrawer from '../components/chat/SourceDrawer';
 import AttachmentViewer from '../components/agents/AttachmentViewer';
 import ImageLightbox from '../components/agents/ImageLightbox';
 import * as agentService from '../services/agentService';
-import { Send, StopCircle, Sparkles, BookOpen, GraduationCap, FlaskConical, Scale,
+import { Send, StopCircle, Sparkles, Briefcase, GraduationCap, FlaskConical, Scale,
   Plus, X, Loader2, FileText, Image as ImageIcon } from 'lucide-react';
 
 export default function ChatPage() {
@@ -265,23 +265,23 @@ export default function ChatPage() {
 
 const suggestions = [
   {
-    icon: GraduationCap,
-    text: 'What are the admission requirements?',
+    icon: Scale,
+    text: 'Summarize the termination provisions in this agreement',
     color: 'text-violet-500 bg-violet-500/10',
   },
   {
     icon: FlaskConical,
-    text: 'Tell me about research programs',
+    text: 'What are the key findings across these studies?',
     color: 'text-amber-800 bg-amber-900/10',
   },
   {
-    icon: Scale,
-    text: 'Examination policies',
+    icon: Briefcase,
+    text: 'What risks did the latest quarterly report flag?',
     color: 'text-forest-500 bg-forest-500/10',
   },
   {
-    icon: BookOpen,
-    text: 'Available scholarships and funding',
+    icon: GraduationCap,
+    text: 'What do the examination regulations require?',
     color: 'text-terra-500 bg-terra-500/10',
   },
 ];

@@ -114,9 +114,11 @@ export default function AgentsPage() {
     inputRef.current?.focus();
   }, []);
 
-  // Follow the conversation id the backend assigns on the first turn.
+  // Follow the conversation id the backend assigns on the first turn — ONLY when the
+  // URL has no id yet. Navigating on any store/URL mismatch let a stray event from a
+  // switched-away conversation yank the user back (the flicker tug-of-war).
   useEffect(() => {
-    if (activeConversationId && activeConversationId !== conversationId) {
+    if (activeConversationId && !conversationId) {
       navigate(`/agents/${activeConversationId}`, { replace: true });
     }
   }, [activeConversationId]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -446,10 +448,10 @@ export default function AgentsPage() {
 }
 
 const suggestions = [
-  'Summarize our leave policy and check for any open HR tickets about it',
-  'What does the latest research say about marine conservation here?',
-  'Draft a short answer on admission requirements, citing the source documents',
-  'Find the exam regulations and list the key deadlines',
+  'Review this contract and flag any unusual clauses',
+  'Compare these studies and draft a literature summary',
+  'Pull last quarter’s figures and build a summary report',
+  'Find the examination regulations and list the key deadlines',
 ];
 
 function EmptyState({ onSuggestionClick }) {

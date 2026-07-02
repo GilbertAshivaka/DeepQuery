@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { useAuthStore } from '../store/authStore';
-import { BookOpen, Eye, EyeOff, Loader2, ArrowLeft } from 'lucide-react';
+import { Eye, EyeOff, Loader2, ArrowLeft } from 'lucide-react';
 
 export default function LoginPage() {
   const { login, isLoading, error, clearError } = useAuthStore();
@@ -66,9 +66,9 @@ export default function LoginPage() {
             initial={{ scale: 0.8 }}
             animate={{ scale: 1 }}
             transition={{ delay: 0.1, type: 'spring', stiffness: 200 }}
-            className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-gradient-to-br from-amber-800 to-amber-950 text-amber-200 mb-4 shadow-warm-lg"
+            className="inline-flex items-center justify-center w-14 h-14 rounded-2xl overflow-hidden mb-4 shadow-warm-lg"
           >
-            <BookOpen size={28} />
+            <img src="/deepqueryLogo.svg" alt="Deep Query" className="w-full h-full object-cover" />
           </motion.div>
           <h1 className="font-serif text-3xl font-bold text-ink-900">Deep Query</h1>
           <p className="text-ink-600 mt-1">

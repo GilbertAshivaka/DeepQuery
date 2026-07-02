@@ -58,8 +58,11 @@ export const peekLiveRun = () => {
 };
 
 export const useAgentStore = create((set, get) => {
-  // Patch one turn (by id) in place and commit.
+  // Patch one turn (by id) in place and commit. A true no-op when the turn isn't in
+  // the current thread (e.g. a detached stream from a conversation the user switched
+  // away from) — no set(), so it can't churn re-renders of the visible thread.
   const patchTurn = (turnId, mutate) => {
+    if (!get().turns.some((t) => t.id === turnId)) return;
     set((s) => ({
       turns: s.turns.map((t) => {
         if (t.id !== turnId) return t;
@@ -81,7 +84,12 @@ export const useAgentStore = create((set, get) => {
     switch (event.type) {
       case 'run_started':
         patchTurn(turnId, (t) => { t.threadId = event.thread_id || t.threadId; });
-        if (event.conversation_id) set({ activeConversationId: event.conversation_id });
+        // Adopt the backend-assigned conversation id ONLY when we don't have one yet
+        // (the first turn of a new conversation). An unscoped write here let a stream
+        // from a switched-away conversation hijack the view (navigate ping-pong).
+        if (event.conversation_id && !get().activeConversationId) {
+          set({ activeConversationId: event.conversation_id });
+        }
         rememberLiveRun(event.thread_id, event.conversation_id || get().activeConversationId);
         break;
 
@@ -272,7 +280,11 @@ export const useAgentStore = create((set, get) => {
           if (event.proposed_action) t.proposedAction = event.proposed_action;
           if (event.grounded != null) t.grounded = event.grounded;
         });
-        if (event.conversation_id) set({ activeConversationId: event.conversation_id });
+        // Same scoping as run_started: never let a detached stream's `done` yank the
+        // view back to its conversation.
+        if (event.conversation_id && !get().activeConversationId) {
+          set({ activeConversationId: event.conversation_id });
+        }
         // paused → the run is parked at a gate/question; the run is still live server-side.
         if (!event.paused) forgetLiveRun();
         break;
@@ -311,7 +323,10 @@ export const useAgentStore = create((set, get) => {
 
     setActiveConversation: async (conversationId) => {
       if (!conversationId) {
-        set({ activeConversationId: null, turns: [], isLoadingTurns: false });
+        const { streamController } = get();
+        if (streamController) streamController.abort();
+        set({ activeConversationId: null, turns: [], isLoadingTurns: false,
+              isStreaming: false, isStopping: false, streamController: null });
         return;
       }
       // Already loaded in memory (e.g. the URL just updated to the id the backend
@@ -321,9 +336,18 @@ export const useAgentStore = create((set, get) => {
       if (conversationId === current.activeConversationId && current.turns.length > 0) {
         return;
       }
-      // Genuine switch: clear immediately so the previous thread doesn't linger
-      // under the new URL, and flag loading so the empty state doesn't flash.
-      set({ activeConversationId: conversationId, turns: [], isLoadingTurns: true });
+      // Genuine switch: detach the previous conversation's live feed first. The run
+      // keeps executing server-side (executor + event bus); reattachLiveRun picks it
+      // back up from the snapshot when the user returns. Without this abort, the old
+      // stream keeps writing into the store while the new conversation is on screen —
+      // the flicker/navigation tug-of-war.
+      if (current.streamController) current.streamController.abort();
+      // Then clear immediately so the previous thread doesn't linger under the new
+      // URL, and flag loading so the empty state doesn't flash.
+      set({
+        activeConversationId: conversationId, turns: [], isLoadingTurns: true,
+        isStreaming: false, isStopping: false, streamController: null,
+      });
       try {
         const data = await agentService.getConversation(conversationId);
         // Drop a stale response if the user switched again mid-fetch.

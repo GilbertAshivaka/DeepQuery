@@ -116,7 +116,7 @@ export default function Layout() {
         {/* Logo */}
         <div className="relative flex items-center gap-3 px-4 h-16 border-b border-black/10">
           <img
-            src="/DeepQueryLogo.png"
+            src="/deepqueryLogo.svg"
             alt="DeepQuery"
             className="w-8 h-8 rounded-lg object-cover flex-shrink-0"
           />

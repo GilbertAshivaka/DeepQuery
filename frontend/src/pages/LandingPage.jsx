@@ -205,7 +205,7 @@ export default function LandingPage() {
 
             <div className="relative z-10">
               <img
-                src="/DeepQueryLogo.png"
+                src="/deepqueryLogo.svg"
                 alt="DeepQuery"
                 className="w-12 h-12 rounded-xl object-cover mx-auto mb-6"
               />
@@ -234,7 +234,7 @@ export default function LandingPage() {
         <div className="max-w-6xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2">
             <img
-              src="/DeepQueryLogo.png"
+              src="/deepqueryLogo.svg"
               alt="DeepQuery"
               className="w-6 h-6 rounded-lg object-cover"
             />
