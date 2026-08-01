@@ -85,7 +85,7 @@ services:
     container_name: deepquery-chroma
     # Internal only — reached as `chroma:8000` over deepquery-net.
     volumes:
-      - chroma_data:/chroma/chroma
+      - chroma_data:/data
     environment:
       - IS_PERSISTENT=TRUE
       - ANONYMIZED_TELEMETRY=FALSE
@@ -108,6 +108,12 @@ services:
     restart: unless-stopped
     networks:
       - deepquery-net
+  environment:
+    - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}
+    - NEO4J_PLUGINS=["apoc"]
+    - NEO4J_server_memory_heap_initial__size=256m
+    - NEO4J_server_memory_heap_max__size=256m
+    - NEO4J_server_memory_pagecache_size=128m
 
   # ── Frontend ─────────────────────────────────────────────────
   frontend:
