@@ -44,6 +44,10 @@ class Slot(str, Enum):
     ORCHESTRATION = "orchestration"
     GENERATION = "generation"
     VERIFICATION = "verification"
+    # Document script generation (the produce sandbox). Unconfigured → falls back to
+    # GENERATION, so a deployment can point a code-strong model at document building
+    # without touching what answers chat.
+    PRODUCE = "produce"
     # Classic RAG pipeline roles:
     CHAT = "chat"                      # RAG answer generation
     SELF_CORRECTION = "self_correction"  # answer verification / correction
@@ -66,6 +70,7 @@ SLOT_TEMPERATURES = {
     Slot.ORCHESTRATION: 0.1,
     Slot.GENERATION: 0.2,
     Slot.VERIFICATION: 0.0,
+    Slot.PRODUCE: 0.2,
     Slot.CHAT: 0.2,
     Slot.SELF_CORRECTION: 0.0,
     Slot.EXTRACTION: 0.0,
@@ -73,6 +78,11 @@ SLOT_TEMPERATURES = {
 
 # Cap output tokens for providers that require/accept an explicit ceiling.
 DEFAULT_MAX_TOKENS = 4096
+# Sentinel for "no output cap": the provider's output-token parameter is omitted
+# entirely, so its own maximum applies (a long document script is never truncated by
+# our config). Anthropic REQUIRES max_tokens, so it gets a large fixed ceiling instead.
+UNCAPPED = -1
+ANTHROPIC_UNCAPPED_TOKENS = 64000
 
 
 class ModelSlotError(RuntimeError):
@@ -95,6 +105,10 @@ def _resolve_slot(slot: Slot) -> tuple[str, str, str | None, dict]:
     provider = getattr(settings, f"agent_{slot.value}_provider", "").lower().strip()
     model = getattr(settings, f"agent_{slot.value}_model", "").strip()
     if not provider or not model:
+        if slot is Slot.PRODUCE:
+            # PRODUCE is optional config — unconfigured, document scripts are written
+            # by the GENERATION model (the pre-slot behavior).
+            return _resolve_slot(Slot.GENERATION)
         raise ModelSlotError(
             f"Slot '{slot.value}' is not configured "
             f"(agent_{slot.value}_provider / agent_{slot.value}_model)."
@@ -202,11 +216,13 @@ def _build_chat_model(
 
     ``base_url`` (when set, e.g. from a DB config row) overrides the env default for
     OpenAI / OpenAI-compatible providers. ``max_tokens`` overrides the output-token
-    ceiling (produce script-generation needs far more than a chat answer). API keys
+    ceiling; ``UNCAPPED`` omits the parameter entirely so the provider's own maximum
+    applies (Anthropic, which requires it, gets ``ANTHROPIC_UNCAPPED_TOKENS``). API keys
     resolve BYOK-first then managed env (``provider_keys.resolve_api_key``)."""
     from agents.models import provider_keys  # lazy: avoids module-load cycle
 
-    out_tokens = max_tokens or DEFAULT_MAX_TOKENS
+    uncapped = max_tokens == UNCAPPED
+    out_tokens = None if uncapped else (max_tokens or DEFAULT_MAX_TOKENS)
     if provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -217,7 +233,7 @@ def _build_chat_model(
             model=model,
             google_api_key=key,
             temperature=temperature,
-            **({"max_output_tokens": max_tokens} if max_tokens else {}),
+            **({"max_output_tokens": max_tokens} if max_tokens and not uncapped else {}),
         )
 
     if provider == "groq":
@@ -231,7 +247,7 @@ def _build_chat_model(
             api_key=key,
             temperature=temperature,
             streaming=streaming,
-            max_tokens=out_tokens,
+            **({"max_tokens": out_tokens} if out_tokens else {}),
             **_groq_quirks(model, for_tools=for_tools),
         )
 
@@ -246,7 +262,9 @@ def _build_chat_model(
         key = provider_keys.resolve_api_key("anthropic")
         if not key:
             raise ModelSlotError("No API key for provider 'anthropic' (set a BYOK key or anthropic_api_key).")
-        kwargs = dict(model=model, api_key=key, max_tokens=out_tokens)
+        # Anthropic requires an explicit max_tokens — UNCAPPED maps to a large ceiling.
+        anthropic_out = out_tokens or ANTHROPIC_UNCAPPED_TOKENS
+        kwargs = dict(model=model, api_key=key, max_tokens=anthropic_out)
         # Runtime-overridable via the Settings UI (app_settings flag), falling back to the
         # env default. A flag change bumps the config version, rebuilding this cached model.
         from agents.models import config_store  # lazy: avoids import cycle at module load
@@ -259,7 +277,7 @@ def _build_chat_model(
         if extended_thinking:
             # Extended thinking surfaces CoT as `thinking` content blocks. It requires
             # temperature=1 and a thinking budget strictly below max_tokens.
-            budget = max(1024, min(settings.agent_anthropic_thinking_budget, out_tokens - 1024))
+            budget = max(1024, min(settings.agent_anthropic_thinking_budget, anthropic_out - 1024))
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
             kwargs["temperature"] = 1
         else:
@@ -310,7 +328,7 @@ def _build_chat_model(
             base_url=resolved_base_url,
             temperature=temperature,
             streaming=streaming,
-            max_tokens=out_tokens,
+            **({"max_tokens": out_tokens} if out_tokens else {}),
         )
 
     if provider == "ollama":
@@ -326,7 +344,7 @@ def _build_chat_model(
             base_url=settings.ollama_base_url,
             temperature=temperature,
         )
-        if max_tokens:
+        if max_tokens and not uncapped:
             kwargs["num_predict"] = max_tokens  # Ollama's output-token cap
         # Enable local reasoning mode only for models that support it (else Ollama
         # errors). The CoT surfaces in additional_kwargs['reasoning_content'].

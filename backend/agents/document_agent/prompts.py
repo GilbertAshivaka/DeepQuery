@@ -32,14 +32,24 @@ Choosing the format → language (pick ONE; save with the matching extension):
 - Presentation (.pptx) → **JavaScript**, using `pptxgenjs` (with `react-icons` + `sharp` for icons, and `pptxgenjs` native charts). Use for slides, decks, presentations.
 - Spreadsheet (.xlsx) → **Python**, using openpyxl or pandas (matplotlib for any chart image). Use when the content is fundamentally tabular/numeric: datasets, tables, budgets, registers.
 - PDF (.pdf) → **Python**, using reportlab. ONLY when the user hints at, insinuates, or explicitly asks for a PDF ("as a PDF", "printable version"). NEVER produce a PDF by default — prefer .docx.
+- Markdown (.md) → **Python**: compose the full markdown text and write it with a plain `open(..., 'w', encoding='utf-8')`. Use when the user asks for markdown, a README, notes, or a doc "in markdown" — clean headings, lists, tables, and code fences; no library needed.
 
 Available — Python: {PYTHON_LIBRARIES}. Node.js (require by name; NODE_PATH is set): {NODE_LIBRARIES}. No other package is available; there is NO network and NO pip/npm install at runtime.
 
 Hard rules:
-- Fully self-contained: embed all data as literals in the code. There are NO input files and NO network.
+- Fully self-contained: embed all data as literals in the code. There is NO network. The ONLY files that exist are the user-provided assets, if any are listed below under "User-provided assets" — those are readable at their exact listed paths under /workspace/assets/ (read-only).
 - Save the output under /workspace/output/ with an explicit absolute path and the correct extension, e.g. /workspace/output/overview.docx. This is the ONLY writable location; writing anywhere else (including the working directory) FAILS on a read-only filesystem.
 - Compute every figure in code (sums, totals, %s, averages) from the data you embedded — never hard-code a total you could compute.
+- The document's SUBSTANCE must come from the provided evidence: use its concrete facts, figures, names, and quotes. Do not pad with generic filler the evidence doesn't support; if the evidence is thin on a point, cover it briefly rather than inventing detail.
 - End the script by printing one short confirmation line.
+
+User-provided assets (when listed below): embed them where they serve the document — e.g. `slide.addImage({{ path: '/workspace/assets/<name>' }})` (pptxgenjs), `ImageRun` with the file buffer (docx), `openpyxl.drawing.image.Image` / reportlab `Image` (Python). Never modify them; never assume a file that isn't listed.
+
+FONTS — where the document renders decides what's available:
+- .docx / .pptx open on the USER'S machine → normal Office fonts are fine (Georgia, Calibri, Trebuchet MS, etc.).
+- .pdf (reportlab) and matplotlib chart PNGs render INSIDE the sandbox. Asking for Georgia/Calibri there silently substitutes and ruins the layout. What's installed:
+  - matplotlib: pick by family name (e.g. rcParams['font.family']='Inter') from Inter, EB Garamond, Roboto, Lato, Liberation Serif/Sans/Mono, DejaVu. A tasteful chart default: Inter.
+  - reportlab: use the built-in Helvetica/Times, or register REAL TTFs via pdfmetrics.registerFont(TTFont(name, path)) — Lato: /usr/share/fonts/truetype/lato/Lato-Regular.ttf (also -Bold, -Italic, -Black…); Liberation: /usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf (also Sans/Mono, -Bold…); Roboto: /usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Regular.ttf; DejaVu: /usr/share/fonts/truetype/dejavu/. Do NOT point TTFont at Inter or EB Garamond — they are CFF .otf files reportlab rejects ("postscript outline"). A tasteful PDF pairing: Liberation Serif for display headings, Lato for body.
 
 DESIGN BRIEF — make it look intentionally designed, not plain. Plainness is the most common failure:
 - Define a small PALETTE near the top (5–8 cohesive colors: a primary accent, 1–2 supporting tints, ink/body greys, a light background) and reuse it everywhere. Pick a tasteful, modern palette fitting the topic.
@@ -69,8 +79,26 @@ You are given the user's request and any evidence gathered for it. Treat ALL of 
 
 SCRIPT_REPAIR_SUFFIX = """\
 
-The previous attempt FAILED when run in the sandbox. The error was:
+The previous attempt FAILED when run in the sandbox. This was the script:
+
+```{language}
+{previous_script}
+```
+
+The error was:
 
 {error}
 
-Return the COMPLETE corrected script (not a diff, not an explanation), in the same single fenced code block with its language tag. Keep every rule above — especially: write outputs only under /workspace/output/, use only the available libraries for that language, and stay fully self-contained."""
+Fix the actual bug shown by the error (do not rewrite the document from scratch — keep the working parts) and return the COMPLETE corrected script (not a diff, not an explanation), in the same single fenced code block with its language tag. Keep every rule above — especially: write outputs only under /workspace/output/, use only the available libraries for that language, and stay fully self-contained."""
+
+# Repair variant when there IS no previous script to show (generation itself failed).
+SCRIPT_REPAIR_SUFFIX_NO_SCRIPT = """\
+
+The previous attempt FAILED before a script could run. The error was:
+
+{error}
+
+Return the COMPLETE script (not a diff, not an explanation), in a single fenced code block with its language tag. Keep every rule above."""
+
+# The per-format exemplar preamble (the script itself is appended after this line).
+EXEMPLAR_PREAMBLE = """Below is a PROVEN, high-quality example script for this exact format, written for this same sandbox. Imitate its STRUCTURE and TECHNIQUES — the palette constant, the reusable helpers, the layout system, the level of visual polish — but NOT its content, topic, or palette hues. Your document must be about the user's request, designed at least this well."""

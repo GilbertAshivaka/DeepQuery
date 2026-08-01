@@ -1,6 +1,6 @@
 {
   "name": "deepquery-doctools",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "Node toolchain for the document sandbox: design-rich docx & pptx (matches Examples/).",
   "dependencies": {

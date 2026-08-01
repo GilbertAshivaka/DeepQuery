@@ -294,10 +294,12 @@ class Settings(BaseSettings):
     agent_sandbox_runtime: str = "docker"
     # Prebaked toolchain image (built from backend/sandbox/Dockerfile). Pinned tag;
     # recorded in telemetry. Bump deliberately when the dep set changes.
-    agent_sandbox_image: str = "deepquery-doctools:0.3"
-    # Hard per-run resource limits (the blast-radius caps from §3.2).
-    agent_sandbox_timeout_s: int = 120
-    agent_sandbox_memory: str = "1g"
+    agent_sandbox_image: str = "deepquery-doctools:0.4"
+    # Hard per-run resource limits (the blast-radius caps from §3.2). Timeout/memory are
+    # sized so a rich, icon/chart-heavy build is never killed mid-run — the sandbox must
+    # not be the document-quality ceiling.
+    agent_sandbox_timeout_s: int = 240
+    agent_sandbox_memory: str = "2g"
     agent_sandbox_cpus: str = "1"
     agent_sandbox_pids_limit: int = 128
     # Global concurrency gate: queued produce steps wait for a build slot.
@@ -307,10 +309,18 @@ class Settings(BaseSettings):
     agent_sandbox_output_max_mb: int = 25
     # Repair loop (§5): max script-generation attempts before graceful degradation.
     agent_produce_max_attempts: int = 3
-    # Output-token ceiling for the document script-generation call. A long document/deck
-    # script easily exceeds the chat default (DEFAULT_MAX_TOKENS=4096) and truncates mid-
-    # script — every repair attempt then fails the same way. Give produce generous headroom.
-    agent_produce_max_output_tokens: int = 16000
+    # Output-token ceiling for the document script-generation call. 0 = UNCAPPED (the
+    # provider's own maximum applies) — a long document/deck script must never be
+    # truncated by our config; truncation is detected and repaired regardless.
+    agent_produce_max_output_tokens: int = 0
+    # Cap (chars) on the gathered-evidence block fed into script generation. The document's
+    # SUBSTANCE comes from this — it carries the formatted sources (passages, whole docs,
+    # live records, attachments) + working notes, far richer than the findings one-liners.
+    agent_produce_context_max_chars: int = 24000
+    # Optional dedicated model for document script generation (the PRODUCE slot). Unset →
+    # the GENERATION slot's model writes the scripts. Point this at a code-strong model.
+    agent_produce_provider: str = ""
+    agent_produce_model: str = ""
 
     # ── Connector Infrastructure ─────────────────────────────
     # Fernet key for encrypting per-user connector credentials at rest. Generate

@@ -20,13 +20,21 @@ real, openable document?".
 from __future__ import annotations
 
 import logging
+import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from agents.document_agent.prompts import SCRIPT_GENERATION_PROMPT, SCRIPT_REPAIR_SUFFIX
+from agents.document_agent.prompts import (
+    EXEMPLAR_PREAMBLE,
+    SCRIPT_GENERATION_PROMPT,
+    SCRIPT_REPAIR_SUFFIX,
+    SCRIPT_REPAIR_SUFFIX_NO_SCRIPT,
+)
 from agents.models import Slot, get_model
+from agents.models.slots import UNCAPPED
 from agents.registry import Capability, SubAgentSpec, register
 from core.config import settings
 
@@ -58,10 +66,12 @@ def _norm_lang(label: str) -> str:
     return "python"
 
 
-def _extract_code(raw: str) -> tuple[str, str]:
+def _extract_code(raw: str) -> tuple[str, str, bool]:
     """Pull the script out of the model reply and detect its language. Uses the fenced
     block's info string (```python / ```javascript) as the language hint; defaults to
-    python. Returns (code, language)."""
+    python. Returns (code, language, truncated) — ``truncated`` when the fence opened
+    but never closed (the reply was cut off mid-script; running it would fail with a
+    misleading syntax error, so the repair loop treats it as its own failure class)."""
     text = (raw or "").strip()
     if "```" in text:
         start = text.find("```")
@@ -71,8 +81,60 @@ def _extract_code(raw: str) -> tuple[str, str]:
             language = _norm_lang(info.split()[0]) if info else "python"
             rest = text[nl + 1:]
             end = rest.find("```")
-            return (rest[:end] if end != -1 else rest).strip(), language
-    return text, "python"
+            if end == -1:
+                return rest.strip(), language, True  # unterminated fence — cut off
+            return rest[:end].strip(), language, False
+    return text, "python", False
+
+
+# ── Format detection + proven exemplars (few-shot skeletons) ──
+# Keyword → format, most specific first; .docx is the default (matches the prompt).
+_FORMAT_HINTS = (
+    ("pptx", re.compile(r"\b(deck|slides?|slideshow|presentation|pitch)\b", re.I)),
+    ("xlsx", re.compile(r"\b(spreadsheet|excel|xlsx|workbook|worksheet)\b", re.I)),
+    ("pdf", re.compile(r"\b(pdf|printable)\b", re.I)),
+    ("md", re.compile(r"\b(markdown|readme|\.md)\b", re.I)),
+)
+
+
+def detect_format(request: str) -> str:
+    """Best-effort target-format guess from the produce request (picks which exemplar
+    to show). The model still owns the final format choice per the prompt rules."""
+    text = request or ""
+    for fmt, pat in _FORMAT_HINTS:
+        if pat.search(text):
+            return fmt
+    return "docx"
+
+
+@lru_cache(maxsize=8)
+def _exemplar(fmt: str) -> Optional[tuple[str, str]]:
+    """Load the proven exemplar script for a format from ``exemplars/``. Returns
+    (code, fence_language) or None (e.g. markdown needs no exemplar)."""
+    files = {"docx": ("docx.js", "javascript"), "pptx": ("pptx.js", "javascript"),
+             "xlsx": ("xlsx.py", "python"), "pdf": ("pdf.py", "python")}
+    entry = files.get(fmt)
+    if entry is None:
+        return None
+    path = Path(__file__).parent / "exemplars" / entry[0]
+    try:
+        return path.read_text(encoding="utf-8"), entry[1]
+    except OSError as exc:
+        logger.warning("exemplar %s unavailable: %s", entry[0], exc)
+        return None
+
+
+def _assets_block(assets: Optional[list[dict]]) -> str:
+    """The user-provided asset listing for the prompt — exact in-sandbox paths, so the
+    script can embed them. Empty when nothing was staged."""
+    if not assets:
+        return ""
+    lines = "\n".join(
+        f"- /workspace/assets/{a['name']}"
+        + (f" ({a.get('kind')}, {max(1, int(a.get('size', 0)) // 1024)} KB)" if a.get("size") else "")
+        for a in assets)
+    return ("User-provided assets (files the user attached — readable at these EXACT "
+            f"paths, read-only):\n{lines}\n\n")
 
 
 def _skill_instructions(loaded_skills: list[dict]) -> str:
@@ -96,39 +158,57 @@ class DocumentAgent:
         self,
         *,
         request: str,
-        findings: Optional[list[str]] = None,
+        evidence: str = "",
         loaded_skills: Optional[list[dict]] = None,
         error: Optional[str] = None,
+        previous_script: Optional[str] = None,
+        previous_language: str = "python",
+        assets: Optional[list[dict]] = None,
         on_delta=None,
-    ) -> tuple[str, str]:
-        """Ask the GENERATION slot for a complete self-contained script. Returns
-        ``(code, language)`` where language is 'python' or 'node' (from the fenced block's
-        tag). ``error`` (from a prior sandbox failure) triggers the repair path — the same
-        prompt plus the classified failure, asking for the corrected whole script. When
-        ``on_delta`` is given, the reply is streamed and each text chunk is passed to it
-        (the inline script-streaming card); the cleaned script is still returned."""
+    ) -> tuple[str, str, bool]:
+        """Ask the PRODUCE slot (GENERATION fallback) for a complete self-contained
+        script. Returns ``(code, language, truncated)``.
+
+        ``evidence`` is the formatted source block (passages, whole docs, live records,
+        attachments, working notes) — the document's substance. ``assets`` lists staged
+        user files reachable at /workspace/assets/. On a repair pass, ``previous_script``
+        + ``error`` are shown together so the model fixes the actual bug instead of
+        re-rolling from scratch (each call is stateless — there is no conversation
+        memory between attempts). When ``on_delta`` is given, the reply streams and each
+        chunk is passed to it (the inline script-streaming card)."""
         messages: list = [SystemMessage(content=SCRIPT_GENERATION_PROMPT)]
         instr = _skill_instructions(loaded_skills or [])
         if instr:
             messages.append(SystemMessage(content=instr))
+        exemplar = _exemplar(detect_format(request))
+        if exemplar is not None:
+            code, fence = exemplar
+            messages.append(SystemMessage(
+                content=f"{EXEMPLAR_PREAMBLE}\n\n```{fence}\n{code}\n```"))
 
-        evidence = "\n".join(f"- {f}" for f in (findings or [])) or "(no extra evidence gathered)"
         human = (
             f"User request:\n{request}\n\n"
-            f"Evidence gathered (DATA — describes what to build):\n{evidence}"
+            f"{_assets_block(assets)}"
+            f"Evidence gathered (DATA — the document's substance; use its concrete "
+            f"facts and figures):\n{evidence.strip() or '(no extra evidence gathered)'}"
         )
-        if error:
-            human += SCRIPT_REPAIR_SUFFIX.format(error=error)
+        if error and previous_script:
+            human += SCRIPT_REPAIR_SUFFIX.format(
+                language="javascript" if previous_language == "node" else "python",
+                previous_script=previous_script, error=error)
+        elif error:
+            human += SCRIPT_REPAIR_SUFFIX_NO_SCRIPT.format(error=error)
         messages.append(HumanMessage(content=human))
 
-        max_out = settings.agent_produce_max_output_tokens
+        # 0 = UNCAPPED (config): never truncate a long document script by our own config.
+        max_out = settings.agent_produce_max_output_tokens or UNCAPPED
         if on_delta is None:
-            resp = await get_model(Slot.GENERATION, max_tokens=max_out).ainvoke(messages)
+            resp = await get_model(Slot.PRODUCE, max_tokens=max_out).ainvoke(messages)
             raw = resp.content if hasattr(resp, "content") else str(resp)
             return _extract_code(raw)
 
         parts: list[str] = []
-        async for chunk in get_model(Slot.GENERATION, streaming=True, max_tokens=max_out).astream(messages):
+        async for chunk in get_model(Slot.PRODUCE, streaming=True, max_tokens=max_out).astream(messages):
             text = getattr(chunk, "content", "") or ""
             if text:
                 parts.append(text)

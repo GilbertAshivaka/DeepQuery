@@ -140,7 +140,10 @@ async def run_agent(
         for a in rows:
             a.conversation_id = conversation_id
             a.turn_id = user_turn.id
-            attachments.append({"filename": a.filename, "text": a.extracted_text or "", "kind": a.kind})
+            # stored_path lets a produce step stage image assets into the sandbox
+            # (read-only /workspace/assets) so generated documents can embed them.
+            attachments.append({"id": a.id, "filename": a.filename, "text": a.extracted_text or "",
+                                "kind": a.kind, "stored_path": a.stored_path})
         db.commit()
 
     # Per-run identity, generated up front so the event bus key is known before the

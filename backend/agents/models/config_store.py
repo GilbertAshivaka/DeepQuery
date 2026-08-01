@@ -35,6 +35,7 @@ LLM_ROLES = (
     "orchestration",
     "generation",
     "verification",
+    "produce",           # document script generation (unset → falls back to generation)
     "chat",
     "self_correction",
     "extraction",

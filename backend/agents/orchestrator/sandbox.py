@@ -112,11 +112,13 @@ def _lang(language: str) -> str:
     return "python"
 
 
-def _build_cmd(job_dir: Path, image: str, language: str, name: str) -> list[str]:
+def _build_cmd(job_dir: Path, image: str, language: str, name: str,
+               assets_dir: Optional[Path] = None) -> list[str]:
     """The exact, proven flag set from backend/sandbox/README.md, for the chosen runtime.
-    Input is NOT mounted — the script is self-contained (project decision); only the
-    writable output dir and the read-only script are bound. The container is NAMED so a
-    timeout can kill the container itself (killing the CLI client does not stop it)."""
+    The script stays self-contained for DATA; ``assets_dir`` (user-uploaded images the
+    document should embed) is the one sanctioned input, mounted READ-ONLY at
+    /workspace/assets — the write surface is still only output/. The container is NAMED
+    so a timeout can kill the container itself (killing the CLI client does not stop it)."""
     runtime = (settings.agent_sandbox_runtime or "docker").strip()
     fname, interp = _LANGS[_lang(language)]
     return [
@@ -125,6 +127,7 @@ def _build_cmd(job_dir: Path, image: str, language: str, name: str) -> list[str]
         "--read-only", "--tmpfs", "/tmp",
         "-v", f"{_mount(job_dir / 'output')}:/workspace/output:rw",
         "-v", f"{_mount(job_dir / fname)}:/workspace/{fname}:ro",
+        *(["-v", f"{_mount(assets_dir)}:/workspace/assets:ro"] if assets_dir else []),
         "--user", "1000:1000",
         "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges",
@@ -155,6 +158,7 @@ async def run_sandbox(
     language: str = "python",
     image: Optional[str] = None,
     timeout: Optional[int] = None,
+    assets_dir: Optional[Path] = None,
 ) -> SandboxResult:
     """Run a self-contained script (Python or Node) in the sandbox and return the outcome
     + any files it wrote to /workspace/output/. Writes the script into ``job_dir`` under the
@@ -173,7 +177,9 @@ async def run_sandbox(
 
     runtime = (settings.agent_sandbox_runtime or "docker").strip()
     name = f"dq-sandbox-{uuid.uuid4().hex[:12]}"
-    cmd = _build_cmd(job_dir, image, language, name)
+    if assets_dir is not None and not Path(assets_dir).is_dir():
+        assets_dir = None  # nothing staged — don't mount an empty/missing dir
+    cmd = _build_cmd(job_dir, image, language, name, assets_dir=assets_dir)
     sem = await _acquire_slot()
     async with sem:
         try:

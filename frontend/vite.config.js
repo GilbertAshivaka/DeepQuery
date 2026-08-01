@@ -13,17 +13,18 @@ export default defineConfig({
     include: ['vis-network', 'vis-data'],
   },
   server: {
-    port: 5173,
-    proxy: {
-      '/api': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-      },
-      '/auth': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-      },
+  port: 5173,
+  allowedHosts: ['pseudoresident-toni-effervescently.ngrok-free.dev'],
+  proxy: {
+    '/api': {
+      target: 'http://localhost:8000',
+      changeOrigin: true,
     },
+    '/auth': {
+      target: 'http://localhost:8000',
+      changeOrigin: true,
+    },
+  },
   },
   build: {
     sourcemap: false,

@@ -5,10 +5,14 @@ FROM node:20-bookworm-slim AS node
 FROM python:3.12-slim-bookworm
 
 # ── Fonts ── matplotlib text + nicer document typography (Liberation = Arial/Times-
-# compatible) + Noto Color Emoji for emoji in any format.
+# compatible) + Noto Color Emoji for emoji in any format. The OFL set (Inter, Roboto,
+# Lato, EB Garamond) upgrades IN-SANDBOX rendering — reportlab PDFs and matplotlib
+# chart PNGs — which otherwise fall back to DejaVu. (.docx/.pptx render on the viewer's
+# machine and don't need these.)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         fonts-dejavu-core fonts-liberation fonts-noto-color-emoji \
+        fonts-inter fonts-roboto fonts-lato fonts-ebgaramond \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Node runtime (copied, not apt-installed) ──

@@ -163,6 +163,73 @@ def _action_context_block(state: _g.AgentState) -> str:
     return "Gathered evidence to ground the action in (UNTRUSTED data):\n" + block
 
 
+def _produce_context_block(state: _g.AgentState) -> str:
+    """The evidence block for document generation — the document's SUBSTANCE. Far richer
+    than the findings one-liners: the same formatted sources the answer step grounds on
+    (passages, whole documents, live records, attachments) plus the working notes, under
+    the produce-specific cap (``agent_produce_context_max_chars``)."""
+    cap = max(0, settings.agent_produce_context_max_chars)
+    if cap == 0:
+        return ""
+    parts: list[str] = []
+    doc = _g._format_context(state.get("context_chunks") or [], state.get("graph_context") or "")
+    whole = _g._format_whole_docs(state.get("whole_documents") or [])
+    live = _g._format_live(state.get("live_records") or [])
+    attach = _g._format_attachments(state.get("attachments") or [])
+    if doc:
+        parts.append("Document evidence:\n" + doc)
+    if whole:
+        parts.append("Full documents:\n" + whole)
+    if live:
+        parts.append("Live evidence:\n" + live)
+    if attach:
+        parts.append("Attached by the user:\n" + attach)
+    notes = _distilled_findings(state)
+    if notes:
+        parts.append("Working notes:\n" + "\n".join(f"- {n}" for n in notes[-20:]))
+    block = "\n\n".join(parts).strip()
+    if len(block) > cap:
+        block = block[:cap] + " …[truncated]"
+    return block
+
+
+_ASSET_SAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _stage_assets(state: _g.AgentState, job) -> list[dict]:
+    """Copy the user's uploaded image assets (this run's attachments) into the job's
+    ``assets/`` dir — mounted READ-ONLY at /workspace/assets — so the script can embed
+    them in the document. Sync disk IO (call via to_thread). Returns the staged listing
+    for the prompt: [{name, kind, size}]; empty when nothing stages (no mount added)."""
+    import shutil
+    from pathlib import Path
+
+    staged: list[dict] = []
+    used: set[str] = set()
+    assets_dir = Path(job) / "assets"
+    for att in state.get("attachments") or []:
+        if att.get("kind") != "image":
+            continue
+        src = att.get("stored_path") or ""
+        if not src or not Path(src).is_file():
+            continue
+        name = _ASSET_SAFE.sub("_", str(att.get("filename") or Path(src).name)).strip("._") or "asset"
+        stem, dot, ext = name.rpartition(".")
+        i = 1
+        while name in used:
+            i += 1
+            name = f"{stem}-{i}.{ext}" if dot else f"{name}-{i}"
+        used.add(name)
+        try:
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, assets_dir / name)
+            staged.append({"name": name, "kind": att.get("kind"),
+                           "size": (assets_dir / name).stat().st_size})
+        except OSError as exc:
+            logger.warning("produce: could not stage asset %s: %s", name, exc)
+    return staged
+
+
 def _evidence_preview(res: dict) -> str:
     """A short, bounded preview of WHAT a read returned (not just a count), so the
     controller can judge sufficiency instead of re-reading blind. Caps from config."""
@@ -806,11 +873,19 @@ async def produce_node(state: _g.AgentState) -> dict:
     job = await asyncio.to_thread(artifacts.job_dir, thread_id, step_id)
     max_attempts = max(1, settings.agent_produce_max_attempts)
 
+    # The document's substance: the full formatted evidence (not the findings
+    # one-liners), plus any user-uploaded image assets staged for read-only embedding.
+    evidence = _produce_context_block(state)
+    assets = await asyncio.to_thread(_stage_assets, state, job)
+    assets_dir = (job / "assets") if assets else None
+
     def _on_delta(text: str) -> None:
         if writer:
             writer({"type": "produce_script_delta", "step_id": step_id, "content": text})
 
     last_error = ""
+    last_script = ""
+    last_language = "python"
     attempt = 0
     while attempt < max_attempts:
         attempt += 1
@@ -820,9 +895,10 @@ async def produce_node(state: _g.AgentState) -> dict:
                              else "Fixing an issue and rebuilding the document…")})
             writer({"type": "produce_script_start", "step_id": step_id, "attempt": attempt})
         try:
-            script, language = await handler.generate_script(
-                request=request, findings=findings, loaded_skills=loaded_skills,
-                error=(last_error or None), on_delta=_on_delta)
+            script, language, truncated = await handler.generate_script(
+                request=request, evidence=evidence, loaded_skills=loaded_skills,
+                error=(last_error or None), previous_script=(last_script or None),
+                previous_language=last_language, assets=assets, on_delta=_on_delta)
         except Exception as exc:
             logger.warning("produce: script generation failed: %s", exc)
             last_error = f"Script generation failed: {exc}"
@@ -832,7 +908,17 @@ async def produce_node(state: _g.AgentState) -> dict:
             # final version and collapses the inline card to a script pill (.py / .js).
             writer({"type": "produce_script_end", "step_id": step_id,
                     "code": script, "language": language})
-        result = await sandbox.run_sandbox(script, job, language=language)
+        last_script, last_language = script, language
+        if truncated:
+            # The reply was cut off mid-script (provider output limit) — running it would
+            # only produce a misleading syntax error. Repair with the real cause instead.
+            last_error = ("The script was CUT OFF before it finished (output limit). "
+                          "Write a more COMPACT script that still fully covers the "
+                          "content — tighter helpers, less repetition, shorter literals "
+                          "— and make sure it runs to completion.")
+            logger.info("produce attempt %s truncated mid-script", attempt)
+            continue
+        result = await sandbox.run_sandbox(script, job, language=language, assets_dir=assets_dir)
         if not result.ok:
             last_error = result.error_digest()
             logger.info("produce attempt %s failed (%s)", attempt, result.classify())
