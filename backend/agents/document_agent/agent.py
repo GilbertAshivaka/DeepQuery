@@ -34,6 +34,7 @@ from agents.document_agent.prompts import (
     SCRIPT_REPAIR_SUFFIX_NO_SCRIPT,
 )
 from agents.models import Slot, get_model
+from agents.models.reasoning import extract_text_delta, message_text
 from agents.models.slots import UNCAPPED
 from agents.registry import Capability, SubAgentSpec, register
 from core.config import settings
@@ -204,12 +205,13 @@ class DocumentAgent:
         max_out = settings.agent_produce_max_output_tokens or UNCAPPED
         if on_delta is None:
             resp = await get_model(Slot.PRODUCE, max_tokens=max_out).ainvoke(messages)
-            raw = resp.content if hasattr(resp, "content") else str(resp)
-            return _extract_code(raw)
+            return _extract_code(message_text(resp))
 
         parts: list[str] = []
         async for chunk in get_model(Slot.PRODUCE, streaming=True, max_tokens=max_out).astream(messages):
-            text = getattr(chunk, "content", "") or ""
+            # extract_text_delta, not chunk.content: a thinking-capable model streams typed
+            # blocks, and appending those raw would splice CoT into the generated script.
+            text = extract_text_delta(chunk)
             if text:
                 parts.append(text)
                 try:

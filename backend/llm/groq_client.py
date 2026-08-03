@@ -52,13 +52,20 @@ class GroqClient:
     def _call_with_retry(
         self, messages: list, temperature: float, slot: Slot = Slot.CHAT
     ) -> Optional[str]:
-        """Call the model for ``slot`` with retry and exponential backoff."""
+        """Call the model for ``slot`` with retry and exponential backoff.
+
+        Always returns text, never raw content blocks: ``AIMessage.content`` is a list of
+        typed blocks (not a ``str``) whenever the reply carries a thinking block, which
+        would break every caller here — they all treat the result as a string. Thinking is
+        dropped; only answer text is returned."""
+        from agents.models.reasoning import message_text
+
         llm = self._get_llm(temperature, slot=slot)
 
         for attempt in range(self.MAX_RETRIES):
             try:
                 response = llm.invoke(messages)
-                return response.content
+                return message_text(response)
             except Exception as e:
                 wait = self.BASE_BACKOFF * (2 ** attempt)
                 logger.warning(

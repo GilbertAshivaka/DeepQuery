@@ -10,17 +10,29 @@ fence-stripping and error handling consistent.
 from __future__ import annotations
 
 import json
-from typing import Optional
+from typing import Any, Optional
 
 
-def parse_json_object(text: str) -> Optional[dict]:
+def parse_json_object(text: Any) -> Optional[dict]:
     """Parse a JSON object from a model response, tolerating ```json fences.
+
+    Accepts either the text itself or a raw ``AIMessage.content`` value — which is a list
+    of typed blocks rather than a ``str`` whenever the reply carries a thinking block
+    (Anthropic extended/adaptive thinking). List content is flattened to its answer text
+    first, so callers can keep passing ``resp.content`` directly.
 
     Returns the dict, or ``None`` when the text is empty, isn't valid JSON, or isn't a
     JSON object (a list/scalar yields ``None`` so callers can treat it as a parse miss).
     """
     if not text:
         return None
+    if not isinstance(text, str):
+        # Lazy import keeps this module dependency-free at import time.
+        from agents.models.reasoning import content_to_text
+
+        text = content_to_text(text)
+        if not text:
+            return None
     cleaned = text.strip()
     if cleaned.startswith("```"):
         nl = cleaned.find("\n")

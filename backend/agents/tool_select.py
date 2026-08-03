@@ -29,6 +29,7 @@ from typing import Any, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from agents.models import Slot, get_model
+from agents.models.reasoning import message_text
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -150,7 +151,10 @@ async def native_tool_calls(
     if tool_calls is None:
         return None, ""  # provider didn't surface structured calls → fall back
 
-    content = resp.content if isinstance(resp.content, str) else ""
+    # message_text, not `content if isinstance(str)`: a thinking-capable model returns a
+    # block list, and discarding it would drop the model's own note — which becomes the
+    # approval card's summary line for the action path.
+    content = message_text(resp)
     calls: list[dict] = []
     for tc in tool_calls[: max(1, max_calls)]:
         entry = by_name.get(tc.get("name"))

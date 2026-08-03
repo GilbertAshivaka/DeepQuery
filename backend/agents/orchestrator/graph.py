@@ -31,7 +31,11 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from agents.models import Slot, get_model
-from agents.models.reasoning import extract_reasoning_delta, extract_text_delta
+from agents.models.reasoning import (
+    extract_reasoning_delta,
+    extract_text_delta,
+    message_text,
+)
 from agents.orchestrator.prompts import (
     AGENT_GENERATION_PROMPT,
     AGENT_VERIFICATION_PROMPT,
@@ -311,7 +315,7 @@ async def plan_node(state: AgentState) -> dict:
             SystemMessage(content=INTENT_CLASSIFICATION_PROMPT),
             HumanMessage(content=f"{convo}User request:\n{query}"),
         ])
-        raw = resp.content if hasattr(resp, "content") else str(resp)
+        raw = message_text(resp)
         parsed = _parse_json_object(raw)
         if parsed and parsed.get("intent") in {i.value for i in Intent}:
             intent = Intent(parsed["intent"])
@@ -481,7 +485,7 @@ async def verify_node(state: AgentState) -> dict:
     llm = get_model(Slot.VERIFICATION)
     try:
         resp = await llm.ainvoke(messages)
-        parsed = _parse_json_object(resp.content if hasattr(resp, "content") else str(resp))
+        parsed = _parse_json_object(message_text(resp))
         if parsed and parsed.get("outcome"):
             return {"verification": parsed}
     except Exception as exc:

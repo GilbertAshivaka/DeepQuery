@@ -30,7 +30,11 @@ from langgraph.types import Command, interrupt
 
 from agents import user_prefs
 from agents.models import Slot, get_model
-from agents.models.reasoning import extract_reasoning_delta, extract_text_delta
+from agents.models.reasoning import (
+    extract_reasoning_delta,
+    extract_text_delta,
+    message_text,
+)
 from agents.orchestrator import artifacts
 from agents.orchestrator import skills as _skills
 from agents.orchestrator import graph as _g  # reuse helpers + AgentState (no fork)
@@ -301,7 +305,7 @@ async def _maybe_compact(state: _g.AgentState, writer) -> dict:
     try:
         resp = await get_model(Slot.GENERATION).ainvoke(
             [SystemMessage(content=COMPACTION_PROMPT), HumanMessage(content=blob[:16000])])
-        summary = (resp.content if hasattr(resp, "content") else str(resp)).strip()
+        summary = message_text(resp).strip()
     except Exception as exc:
         logger.warning("compaction failed: %s", exc)
         return {}
@@ -563,7 +567,7 @@ async def controller_node(state: _g.AgentState) -> dict:
                         "Your previous reply was not valid JSON matching the schema. Reply with ONLY "
                         "the JSON object, no prose.")))
                 resp = await llm.ainvoke(messages)
-                raw = resp.content if hasattr(resp, "content") else str(resp)
+                raw = message_text(resp)
                 # Surface the controller's own reasoning trace (gpt-oss parsed channel).
                 rc = (getattr(resp, "additional_kwargs", {}) or {}).get("reasoning_content")
                 if rc and writer:
@@ -1561,7 +1565,7 @@ async def _verify(state: _g.AgentState, answer: str) -> dict:
     ]
     try:
         resp = await get_model(Slot.VERIFICATION).ainvoke(messages)
-        parsed = _g._parse_json_object(resp.content if hasattr(resp, "content") else str(resp))
+        parsed = _g._parse_json_object(message_text(resp))
         if parsed and parsed.get("outcome"):
             return parsed
     except Exception as exc:

@@ -31,6 +31,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from agents.connector_gateway import gateway as _gateway
 from agents.json_utils import parse_json_object as _parse_json_object
 from agents.models import Slot, get_model
+from agents.models.reasoning import message_text
 from agents import tool_select
 from agents.retrieval_agent import connector_index
 from agents.orchestrator.prompts import (
@@ -318,7 +319,7 @@ async def _select_from_list(query: str, candidates: list[dict[str, Any]],
     )
     try:
         resp = await llm.ainvoke([SystemMessage(content=system), HumanMessage(content=human)])
-        parsed = _parse_json_object(resp.content if hasattr(resp, "content") else str(resp))
+        parsed = _parse_json_object(message_text(resp))
     except Exception as exc:
         logger.warning("Connector pre-selection failed: %s — falling back to all candidates", exc)
         return candidates
@@ -344,7 +345,7 @@ async def _extract_intent(query: str, hint: Optional[str] = None) -> Optional[di
             SystemMessage(content=LIVE_CONNECTOR_INTENT_PROMPT),
             HumanMessage(content=_request_text(query, hint)),
         ])
-        parsed = _parse_json_object(resp.content if hasattr(resp, "content") else str(resp))
+        parsed = _parse_json_object(message_text(resp))
     except Exception as exc:
         logger.warning("Connector intent extraction failed: %s", exc)
         return None
@@ -449,7 +450,7 @@ async def _select_calls_json(query: str, catalog: list[dict[str, Any]],
     )
     try:
         resp = await llm.ainvoke([SystemMessage(content=system), HumanMessage(content=human)])
-        parsed = _parse_json_object(resp.content if hasattr(resp, "content") else str(resp))
+        parsed = _parse_json_object(message_text(resp))
     except Exception as exc:
         logger.warning("Live tool selection failed: %s", exc)
         return []

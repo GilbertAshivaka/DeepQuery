@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from agents.models import Slot, config_store, probe_model, provider_keys
+from agents.models.reasoning import message_text
 from agents.models.slots import (
     CLOUD_PROVIDERS,
     DEFAULT_EFFORT,
@@ -264,7 +265,9 @@ def test_model_config(role: str, body: ModelConfigTest):
         llm = probe_model(body.provider, body.model, base_url=body.base_url, role=slot)
         resp = llm.invoke([HumanMessage(content="ping")])
         latency_ms = round((time.perf_counter() - t0) * 1000, 1)
-        sample = (resp.content or "")[:80] if hasattr(resp, "content") else ""
+        # message_text, not resp.content: slicing raw block-list content would put dicts
+        # in the UI's sample line instead of the model's reply.
+        sample = message_text(resp)[:80]
         return {"ok": True, "latency_ms": latency_ms, "sample": sample}
     except ModelSlotError as exc:
         return {"ok": False, "error": str(exc), "kind": "config"}

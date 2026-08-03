@@ -16,14 +16,15 @@ is ever auto-applied.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
-from typing import Any, Optional
+from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from agents.json_utils import parse_json_object as _parse_json_object
 from agents.models import Slot, get_model
+from agents.models.reasoning import message_text
 from agents.skill_sync.prompts import SKILL_SYNC_DIFF_PROMPT
 from core.database import SessionLocal
 from models.database import Document, SkillFile
@@ -70,22 +71,6 @@ def _document_content(db, document_id: str) -> tuple[str, str]:
     if not text:
         text = doc.summary or ""
     return title, text[:MAX_DOC_CHARS]
-
-
-def _parse_json_object(text: str) -> Optional[dict]:
-    if not text:
-        return None
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        nl = cleaned.find("\n")
-        cleaned = cleaned[nl + 1:] if nl != -1 else cleaned[3:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3].strip()
-    try:
-        obj = json.loads(cleaned)
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        return None
 
 
 def _resolve_affected(db, document_id: str, doc_text: str) -> list[tuple[SkillFile, str]]:
@@ -147,7 +132,7 @@ def run_sync_for_document(document_id: str) -> dict[str, Any]:
                         SystemMessage(content=SKILL_SYNC_DIFF_PROMPT),
                         HumanMessage(content=human),
                     ])
-                    parsed = _parse_json_object(resp.content if hasattr(resp, "content") else str(resp))
+                    parsed = _parse_json_object(message_text(resp))
                 except Exception as exc:
                     logger.warning("Diff proposal failed for %s/%s: %s", skill.name, name, exc)
                     continue

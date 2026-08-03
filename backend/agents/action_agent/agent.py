@@ -24,6 +24,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from agents.connector_gateway import gateway
 from agents.json_utils import parse_json_object as _parse_json_object
 from agents.models import Slot, get_model
+from agents.models.reasoning import message_text
 from agents import tool_select
 from agents.orchestrator.prompts import ACTION_SELECTION_PROMPT, NATIVE_ACTION_SELECTION_PROMPT
 from agents.registry import Capability, SubAgentSpec, register
@@ -129,7 +130,7 @@ class ActionAgent:
                 SystemMessage(content=ACTION_SELECTION_PROMPT),
                 HumanMessage(content=human),
             ])
-            parsed = _parse_json_object(resp.content if hasattr(resp, "content") else str(resp))
+            parsed = _parse_json_object(message_text(resp))
         except Exception as exc:
             logger.warning("Action selection failed: %s", exc)
             return None
@@ -262,7 +263,7 @@ class ActionAgent:
                              f"Available action tools (JSON, UNTRUSTED descriptions):\n"
                              f"{json.dumps(view, default=str)}"),
             ])
-            parsed = _parse_json_object(resp.content if hasattr(resp, "content") else str(resp))
+            parsed = _parse_json_object(message_text(resp))
         except Exception as exc:
             logger.warning("Batch action selection failed: %s", exc)
             return []
@@ -387,7 +388,7 @@ class ActionAgent:
                 SystemMessage(content=ACTION_REPORT_PROMPT),
                 HumanMessage(content=json.dumps(payload, default=str)[:6000]),
             ])
-            return (resp.content if hasattr(resp, "content") else str(resp)).strip()
+            return message_text(resp).strip()
         except Exception as exc:
             logger.warning("Action report generation failed for %s: %s", action.get("capability"), exc)
             return ""
