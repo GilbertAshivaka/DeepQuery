@@ -94,12 +94,18 @@ class Settings(BaseSettings):
     model_config_db_enabled: bool = True
 
     # Surface Anthropic extended thinking (Claude 3.7+/4 reasoning) as thinking deltas.
-    # Off by default because enabling it forces temperature=1 and reserves part of the
-    # output budget for thinking — a behavior change for the generation slot. Reasoning
-    # surfacing for Groq / Ollama / DeepSeek / Qwen is always-on and needs no flag.
+    # Off by default because on older models enabling it forces temperature=1 and reserves
+    # part of the output budget for thinking — a behavior change for the generation slot.
+    # Reasoning surfacing for Groq / Ollama / DeepSeek / Qwen is always-on and needs no flag.
     agent_anthropic_extended_thinking: bool = False
     # Token budget reserved for Anthropic extended thinking when enabled (< max_tokens).
+    # Applies to the older models only (thinking type "enabled"); the Claude 5 family
+    # controls thinking depth with an effort level instead — see below.
     agent_anthropic_thinking_budget: int = 2048
+    # Thinking depth for the Claude 5 family, which takes thinking type "adaptive" plus
+    # output_config.effort in place of a token budget. One of the levels in
+    # ``slots.VALID_EFFORTS``. Overridable at runtime via the Settings UI.
+    agent_anthropic_thinking_effort: str = "medium"
 
     # Optional backends for non-default slots.
     anthropic_api_key: str = ""

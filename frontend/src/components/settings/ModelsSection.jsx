@@ -21,7 +21,7 @@ const BASEURL_OPTIONAL = new Set(['openai']);
 const MODEL_HINTS = {
   groq: 'e.g. openai/gpt-oss-120b, llama-3.3-70b-versatile',
   google: 'e.g. gemini-2.0-flash, gemini-2.5-pro',
-  anthropic: 'e.g. claude-sonnet-4-6, claude-opus-4-1',
+  anthropic: 'e.g. claude-opus-5, claude-sonnet-4-6, claude-opus-4-1',
   openai: 'e.g. gpt-4o-mini, gpt-4o',
   deepseek: 'e.g. deepseek-chat, deepseek-reasoner',
   qwen: 'e.g. qwen-plus, qwen-max, qwq-32b',
@@ -147,6 +147,32 @@ export default function ModelsSection() {
             onChange={(v) => setThinking(v)}
             label="Enable Anthropic extended thinking"
           />
+        </div>
+
+        {/* Effort applies to the Claude 5 family, which takes an effort level in place
+            of a token budget. Older Claude models use budget_tokens above. */}
+        <div className="flex items-center justify-between mt-4 pt-4 border-t border-ink-100">
+          <div className="pr-6">
+            <p className="text-sm font-medium text-ink-900">Thinking effort</p>
+            <p className="text-xs text-ink-600 mt-0.5">
+              Applies to Claude 5 models (opus-5, sonnet-5, haiku-4-5). Older Claude
+              models use the token budget instead.
+            </p>
+          </div>
+          <select
+            value={thinking?.effort || 'medium'}
+            disabled={readOnly || !thinking || !thinking.enabled}
+            onChange={(e) => setThinking(!!thinking?.enabled, e.target.value)}
+            className="input !py-2 text-sm w-40"
+          >
+            {(thinking?.effort_options || ['low', 'medium', 'high', 'xhigh', 'max']).map(
+              (level) => (
+                <option key={level} value={level}>
+                  {level}
+                </option>
+              )
+            )}
+          </select>
         </div>
       </section>
     </div>

@@ -55,8 +55,12 @@ export async function getThinkingConfig() {
   return data;
 }
 
-export async function setThinkingConfig(enabled) {
-  const { data } = await api.put('/api/admin/model-config/thinking', { enabled });
+export async function setThinkingConfig({ enabled, effort }) {
+  const { data } = await api.put('/api/admin/model-config/thinking', {
+    enabled,
+    // Omitted → the server leaves the current effort unchanged.
+    ...(effort ? { effort } : {}),
+  });
   return data;
 }
 

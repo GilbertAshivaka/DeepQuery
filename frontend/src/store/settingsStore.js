@@ -112,14 +112,25 @@ export const useSettingsStore = create(
         }
       },
 
-      setThinking: async (enabled) => {
+      // `effort` is optional — omitted, only the on/off flag changes. It applies to the
+      // Claude 5 family, which takes an effort level in place of a token budget.
+      setThinking: async (enabled, effort) => {
         // optimistic
         const prev = get().thinking;
-        set({ thinking: { ...(prev || {}), enabled, source: 'db' } });
+        set({
+          thinking: {
+            ...(prev || {}),
+            enabled,
+            source: 'db',
+            ...(effort ? { effort, effort_source: 'db' } : {}),
+          },
+        });
         try {
-          await settingsService.setThinkingConfig(enabled);
+          await settingsService.setThinkingConfig({ enabled, effort });
           toastSuccess(
-            `Extended thinking ${enabled ? 'enabled' : 'disabled'}.`,
+            effort
+              ? `Thinking effort set to ${effort}.`
+              : `Extended thinking ${enabled ? 'enabled' : 'disabled'}.`,
             'Settings'
           );
         } catch (err) {

@@ -148,6 +148,103 @@ def _is_reasoning_model(model: str) -> bool:
     return any(h in m for h in _REASONING_MODEL_HINTS)
 
 
+# ── Anthropic model generations ──────────────────────────────────
+# Anthropic changed its parameter contract with the Claude 5 family:
+#
+#   older (3.x / 4.x)  temperature required; thinking={"type": "enabled",
+#                      "budget_tokens": N}
+#   Claude 5 family    temperature REJECTED ("`temperature` is deprecated for this
+#                      model"); thinking={"type": "adaptive"} plus a top-level
+#                      output_config={"effort": ...} in place of a token budget
+#
+# Match on explicit family prefixes — never a bare "-5" suffix. 'claude-haiku-4-5' is
+# new-generation while 'claude-sonnet-4-5' / 'claude-opus-4-5' are old, so a substring
+# test on "-5" would misclassify the latter two and break working deployments.
+_ANTHROPIC_ADAPTIVE_FAMILIES = (
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-5",
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-haiku-4-5",
+)
+
+# Effort levels accepted by output_config.effort (anthropic.types.OutputConfigParam).
+# Note 'xhigh' is optional per-model in the API's capability metadata, so it is offered as
+# an explicit admin choice but never auto-selected as a fallback.
+VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+DEFAULT_EFFORT = "medium"
+
+
+def _is_anthropic_adaptive(model: str) -> bool:
+    """Whether an Anthropic model id belongs to the Claude 5 (adaptive-thinking) family.
+
+    Substring match on explicit family prefixes, so a gateway-prefixed id
+    (``anthropic.claude-opus-5`` via Bedrock/Vertex) still classifies correctly. Ids
+    carrying no known marker return False — an unknown alias keeps the long-standing
+    parameter shape rather than silently switching contracts."""
+    m = model.lower().strip()
+    return any(f in m for f in _ANTHROPIC_ADAPTIVE_FAMILIES)
+
+
+def _resolve_effort() -> str:
+    """The thinking effort level for the Claude 5 family: DB flag → env default. An
+    unrecognized value degrades to ``DEFAULT_EFFORT`` rather than raising — a bad flag
+    should never take the agent layer down."""
+    from agents.models import config_store  # lazy: avoids import cycle at module load
+
+    raw = config_store.get_flag(
+        "anthropic_thinking_effort", settings.agent_anthropic_thinking_effort
+    )
+    effort = str(raw or "").lower().strip()
+    if effort not in VALID_EFFORTS:
+        if effort:
+            logger.warning(
+                "Unknown Anthropic thinking effort %r; falling back to %r",
+                effort,
+                DEFAULT_EFFORT,
+            )
+        return DEFAULT_EFFORT
+    return effort
+
+
+def _anthropic_params(
+    model: str, temperature: float | None, extended_thinking: bool, max_out: int
+) -> dict:
+    """Constructor kwargs for ``ChatAnthropic`` that match the model's parameter contract.
+
+    Shared by ``_build_chat_model`` and ``probe_model`` so the two cannot drift apart.
+
+    ``temperature=None`` is how the parameter is omitted from the request entirely:
+    ChatAnthropic declares it ``Optional[float]`` and drops None-valued keys when building
+    the payload. That is the fix for the Claude 5 family, which rejects it outright.
+    """
+    if _is_anthropic_adaptive(model):
+        # Claude 5: no temperature, ever. Thinking depth is an effort level.
+        if not extended_thinking:
+            # Send no thinking config at all — the model applies its own default. An
+            # explicit {"type": "disabled"} is a different opt-out and isn't needed here.
+            return {"temperature": None}
+        return {
+            "temperature": None,
+            "thinking": {"type": "adaptive"},
+            # output_config is not a declared ChatAnthropic field, so it must ride in
+            # model_kwargs to reach the request payload.
+            "model_kwargs": {"output_config": {"effort": _resolve_effort()}},
+        }
+
+    # Older models: unchanged behavior.
+    if not extended_thinking:
+        return {"temperature": temperature}
+    # Extended thinking surfaces CoT as `thinking` content blocks. It requires
+    # temperature=1 and a thinking budget strictly below max_tokens.
+    budget = max(1024, min(settings.agent_anthropic_thinking_budget, max_out - 1024))
+    return {
+        "temperature": 1,
+        "thinking": {"type": "enabled", "budget_tokens": budget},
+    }
+
+
 _reasoning_openai_cls = None
 
 
@@ -205,7 +302,7 @@ def _groq_quirks(model: str, for_tools: bool = False) -> dict:
 def _build_chat_model(
     provider: str,
     model: str,
-    temperature: float,
+    temperature: float | None,
     streaming: bool,
     base_url: str | None = None,
     for_tools: bool = False,
@@ -274,14 +371,19 @@ def _build_chat_model(
                 "anthropic_extended_thinking", settings.agent_anthropic_extended_thinking
             )
         )
-        if extended_thinking:
-            # Extended thinking surfaces CoT as `thinking` content blocks. It requires
-            # temperature=1 and a thinking budget strictly below max_tokens.
-            budget = max(1024, min(settings.agent_anthropic_thinking_budget, anthropic_out - 1024))
-            kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
-            kwargs["temperature"] = 1
-        else:
-            kwargs["temperature"] = temperature
+        # The remaining kwargs depend on the model generation (see _anthropic_params).
+        # Merge model_kwargs rather than assigning, so a future addition here can't
+        # clobber output_config.
+        params = _anthropic_params(model, temperature, extended_thinking, anthropic_out)
+        extra_model_kwargs = params.pop("model_kwargs", None)
+        kwargs.update(params)
+        if extra_model_kwargs:
+            kwargs["model_kwargs"] = {**kwargs.get("model_kwargs", {}), **extra_model_kwargs}
+        # NOTE (langchain-anthropic 0.3.22): its `_thinking_in_params` / structured-output
+        # guards test for thinking type == "enabled", so they don't fire under "adaptive".
+        # Streaming still yields thinking blocks (the thinking_delta branch is
+        # unconditional) and reasoning.py handles them; with_structured_output would take
+        # the plain bind_tools path, which this codebase never exercises.
         return ChatAnthropic(**kwargs)
 
     if provider in ("openai", "openai_compatible", "vllm", "deepseek", "qwen"):
@@ -436,6 +538,9 @@ def probe_model(
     provider = provider.lower().strip()
     if role is not None:
         _assert_deployment_allows(provider, role)
+    # temperature is passed through rather than reaching the provider unconditionally: the
+    # Anthropic branch drops it for the Claude 5 family, which rejects the parameter. A
+    # probe against a Claude 5 model would otherwise 400 even on a correct config.
     return _build_chat_model(provider, model.strip(), 0.0, False, base_url=base_url)
 
 

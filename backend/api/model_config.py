@@ -20,7 +20,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from agents.models import Slot, config_store, probe_model, provider_keys
-from agents.models.slots import CLOUD_PROVIDERS, LOCAL_PROVIDERS, ModelSlotError
+from agents.models.slots import (
+    CLOUD_PROVIDERS,
+    DEFAULT_EFFORT,
+    LOCAL_PROVIDERS,
+    VALID_EFFORTS,
+    ModelSlotError,
+)
 from auth.dependencies import RoleRequired, get_current_user
 from core.config import settings
 from core.constants import UserRole
@@ -59,9 +65,13 @@ class ReindexRequest(BaseModel):
 
 class ThinkingConfigUpdate(BaseModel):
     enabled: bool
+    # Thinking depth for the Claude 5 family (which takes an effort level instead of a
+    # token budget). Omitted → the current effort is left unchanged.
+    effort: Optional[str] = None
 
 
 THINKING_FLAG = "anthropic_extended_thinking"
+EFFORT_FLAG = "anthropic_thinking_effort"
 
 
 def _provider_availability() -> dict:
@@ -142,14 +152,26 @@ def get_thinking_config():
         if db_value is not None
         else bool(settings.agent_anthropic_extended_thinking)
     )
+    db_effort = config_store.get_flag(EFFORT_FLAG, None)
+    effort = str(
+        db_effort if db_effort is not None else settings.agent_anthropic_thinking_effort
+    ).lower().strip()
+    if effort not in VALID_EFFORTS:
+        effort = DEFAULT_EFFORT
     return {
         "enabled": enabled,
         "source": "db" if db_value is not None else "env",
+        "effort": effort,
+        "effort_source": "db" if db_effort is not None else "env",
+        "effort_options": list(VALID_EFFORTS),
+        # Legacy control: applies to the older Claude models (thinking type "enabled").
+        # The Claude 5 family uses `effort` instead.
         "budget_tokens": settings.agent_anthropic_thinking_budget,
         "applies_to": "anthropic",
         "note": (
             "Only affects Anthropic models. Other providers surface chain-of-thought "
-            "automatically and cannot be toggled."
+            "automatically and cannot be toggled. Effort applies to the Claude 5 family; "
+            "older Claude models use the token budget instead."
         ),
     }
 
@@ -159,17 +181,29 @@ def set_thinking_config(
     body: ThinkingConfigUpdate,
     user: User = Depends(get_current_user),
 ):
-    """Enable/disable Anthropic extended thinking at runtime. Bumps the config version so
-    cached Anthropic models rebuild across workers on the next call."""
+    """Enable/disable Anthropic extended thinking at runtime, and optionally set the
+    thinking effort used by the Claude 5 family. Bumps the config version so cached
+    Anthropic models rebuild across workers on the next call."""
     if not settings.model_config_db_enabled:
         raise HTTPException(
             status_code=409,
             detail="DB-backed model config is disabled (model_config_db_enabled=False).",
         )
+    effort = None
+    if body.effort is not None:
+        effort = body.effort.lower().strip()
+        if effort not in VALID_EFFORTS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid effort '{body.effort}'. One of: {', '.join(VALID_EFFORTS)}.",
+            )
     config_store.set_flag(THINKING_FLAG, bool(body.enabled), updated_by=user.id)
+    if effort is not None:
+        config_store.set_flag(EFFORT_FLAG, effort, updated_by=user.id)
     return {
         "enabled": bool(body.enabled),
         "source": "db",
+        **({"effort": effort, "effort_source": "db"} if effort is not None else {}),
         "version": config_store.current_version(),
     }
 
