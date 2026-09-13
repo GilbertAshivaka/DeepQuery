@@ -32,6 +32,10 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_soft_time_limit=600,   # 10 minutes
     task_time_limit=900,         # 15 minutes hard limit
+    broker_connection_retry_on_startup=True,
+    broker_transport_options={
+        "visibility_timeout": 3600,  # must exceed your longest task's hard limit
+    },
 )
 
 # Auto-discover tasks from the tasks package
@@ -59,3 +63,5 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute=0),
     },
 }
+
+

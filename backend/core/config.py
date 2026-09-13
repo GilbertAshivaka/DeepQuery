@@ -225,6 +225,33 @@ class Settings(BaseSettings):
     jwt_access_token_expire_minutes: int = 30
     jwt_refresh_token_expire_days: int = 7
 
+    # ── Outbound email (Resend) ──────────────────────────────
+    # Transactional mail only (password resets, invites) — never bulk/marketing.
+    # We call Resend's HTTPS API rather than SMTP on purpose: DigitalOcean (and most
+    # cloud providers) block outbound ports 25/465/587 by default, so an SMTP client
+    # hangs on the droplet while working fine from a laptop. Port 443 is never blocked.
+    resend_api_key: str = ""
+    # Sending identity. The from-address lives on a SUBDOMAIN (send.getdeepquery.com)
+    # so its SPF record can't collide with the root domain's mailbox-provider SPF
+    # (only one SPF record per name is legal), and so a burst of app mail can't burn
+    # the reputation of the domain human mail flows over.
+    mail_from: str = "DeepQuery <noreply@send.getdeepquery.com>"
+    # Replies go to a real monitored mailbox — noreply@ on the sending subdomain has
+    # no inbox, so without this a user hitting Reply is talking to nobody.
+    mail_reply_to: str = ""
+    # Master switch. When False (the default), send_email() logs the rendered message
+    # and returns without calling out — so dev/test never emails real people. Turn on
+    # in production alongside resend_api_key.
+    mail_enabled: bool = False
+
+    # ── Password reset ───────────────────────────────────────
+    # Reset links are single-use and short-lived: the window in which a leaked link
+    # (mail forwarded, shared screen, mailbox breach) is usable.
+    password_reset_token_ttl_minutes: int = 60
+    # Per-address request cap, to keep the endpoint from being used to flood someone's
+    # inbox. Counted over the TTL window above.
+    password_reset_max_per_window: int = 5
+
     # ── Celery / Redis ───────────────────────────────────────
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_result_backend: str = "redis://localhost:6379/1"
